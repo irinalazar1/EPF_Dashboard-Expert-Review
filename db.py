@@ -204,10 +204,24 @@ def save_submission(rows_df):
         release_connection(conn)
 
 
-def load_submissions():
+def load_submissions(expert_id=None, forecast_date=None):
+    """Full table by default (scoreboard/reveal pages need every row), but
+    accepts optional filters so the review page -- which only ever needs
+    one (expert, date) pair to restore an in-progress session -- doesn't
+    pull every submission ever made just to check one."""
     conn = get_connection()
     try:
-        df_submissions = pd.read_sql_query("SELECT * FROM submissions", conn)
+        query = "SELECT * FROM submissions"
+        conditions, params = [], []
+        if expert_id is not None:
+            conditions.append("expert_id = %s")
+            params.append(expert_id)
+        if forecast_date is not None:
+            conditions.append("forecast_date = %s")
+            params.append(str(forecast_date))
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        df_submissions = pd.read_sql_query(query, conn, params=params)
     finally:
         release_connection(conn)
     if not df_submissions.empty:

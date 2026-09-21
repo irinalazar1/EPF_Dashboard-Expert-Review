@@ -76,6 +76,31 @@ load_dotenv()
 
 # Run the Streamlit Dashboard using 'streamlit run app.py'
 
+
+# --------------------------------------------------------------------------
+# CACHED DB READS
+#
+# The draggable chart triggers a full st.rerun() on every drag release, and
+# has_submitted()/load_submissions() were being called uncached on each of
+# those reruns -- a live Postgres round-trip per drag. A short TTL removes
+# that from the hot path; correctness doesn't suffer because (a) the
+# submissions_unique_slot DB constraint is the real backstop against a
+# double submit regardless of cache staleness, and (b) both caches are
+# cleared the moment a submission actually saves, below.
+# --------------------------------------------------------------------------
+
+@st.cache_data(ttl=15)
+def _cached_has_submitted(expert_id, forecast_date):
+    return has_submitted(expert_id, forecast_date)
+
+
+@st.cache_data(ttl=15)
+def _cached_load_submissions(expert_id=None, forecast_date=None):
+    """Same short-TTL treatment, plus scoping: passing expert_id/forecast_date
+    avoids pulling the whole submissions table just to restore one
+    in-progress session (see load_submissions() in db.py)."""
+    return load_submissions(expert_id, forecast_date)
+
 st.set_page_config(page_title='EPF Expert Review', layout='wide')
 st.title('Electricity Price Forecasting - RLHF')
 
@@ -280,11 +305,6 @@ def apply_theme():
         .st-emotion-cache-he5m1v.etak9234 {{
             background-color: {palette['accent']} !important;
             border-color: {palette['accent']} !important;
-        }}
-        /* Restore the question mark inside the tooltip icon */
-        [data-testid="stTooltipIcon"] svg {{
-            fill: none !important;
-            stroke: {palette['text_muted']} !important;
         }}
         </style>
         """,
@@ -740,22 +760,13 @@ def render_submission_survey(expert_id, forecast_date, survey_key):
                 value="Some familiarity",
             )
 
-        usability = st.slider(
-            "How easy was it to use this application for this task?", 
-            1, 5, 3,
-            help="1 = Very difficult | 5 = Very easy"
-        )
-
+        usability = st.slider("How easy was it to use this application for this task?", 1, 5, 3)
         comprehension = st.slider(
-            "How well did you understand the forecast chart and uncertainty band (shaded region)?", 
-            1, 5, 3,
-            help="1 = Did not understand at all | 5 = Understood perfectly"
+            "How well did you understand the forecast chart and uncertainty band (shaded region)?", 1, 5, 3
         )
-
         context_relevance = st.slider(
             "How useful was the additional context (temperature, humidity, solar/wind) for making your adjustment?",
             1, 5, 3,
-            help="1 = Not at all useful | 5 = Extremely useful"
         )
         comment = st.text_area("Anything else you'd like to share about this session? (optional)", height=80)
 
@@ -917,13 +928,14 @@ def page_review_and_adjust():
 
     key = f"{expert_id}_{forecast_date}"  # one working copy per (expert, date) pair in session state
     survey_key = f"survey_pending_{key}"  # set True right after a fresh submission, see below
-    already_submitted = has_submitted(expert_id, forecast_date) if expert_id else False
+    already_submitted = _cached_has_submitted(expert_id, forecast_date) if expert_id else False
     is_read_only = (current_role == "admin")
 
     if key not in st.session_state:
         # Restore a prior unsubmitted session (navigated away before
-        # submitting) instead of resetting to the raw forecast.
-        log = load_submissions()
+        # submitting) instead of resetting to the raw forecast. Scoped to
+        # this one (expert, date) pair -- see _cached_load_submissions().
+        log = _cached_load_submissions(expert_id, forecast_date)
         if not log.empty:
             past_sub = log[(log["expert_id"] == expert_id) & (log["forecast_date"] == forecast_date)]
             if not past_sub.empty:
@@ -984,8 +996,8 @@ def page_review_and_adjust():
         with st.container(border=True):
             st.subheader("Solar & Wind - Renewables")
             sc1, sc2 = st.columns(2)
-            show_solar = sc1.toggle("Solar", value=True)
-            show_wind = sc2.toggle("Wind", value=True)
+            show_solar = sc1.toggle("☀️ Solar", value=True)
+            show_wind = sc2.toggle("💨 Wind", value=True)
 
             wind_total = day_rows["Wind_Offshore_BE"] + day_rows["Wind_Onshore_BE"]
             solar_vals = day_rows["Solar_BE"].values if show_solar else None
@@ -1063,6 +1075,12 @@ def page_review_and_adjust():
                 except DuplicateSubmissionError:
                     st.error("A submission already exists for this date. Refresh the page.")
                 else:
+                    # Invalidate the short-TTL caches so this submission is
+                    # immediately visible everywhere (this page's read-only
+                    # branch, admin's Reveal & Evaluate / Scoreboard) instead
+                    # of waiting out the TTL.
+                    _cached_has_submitted.clear()
+                    _cached_load_submissions.clear()
                     st.session_state[survey_key] = True  # triggers render_submission_survey() on the next render
                     render_success_banner(f"Forecast submitted for {forecast_date}! Saved {len(rows)} adjusted values.")
                     st.rerun()  # forces the page back into the read-only branch above
@@ -1086,7 +1104,7 @@ def page_reveal_and_evaluate():
     compare forecast vs. adjusted against the realized price (MAE each)."""
     st.title("Reveal & Evaluate")
 
-    log = load_submissions()
+    log = _cached_load_submissions()
     if log.empty:
         st.warning("No submissions yet.")
         return
@@ -1163,7 +1181,7 @@ def page_expert_scoreboard():
     rate, avg. confidence."""
     st.title("Expert Scoreboard")
 
-    log = load_submissions()
+    log = _cached_load_submissions()
     if log.empty:
         st.warning("No submissions yet.")
         return
@@ -1276,7 +1294,8 @@ ONBOARDING_STEPS = [
             "Once you're happy with your adjustment, rate how confident you are and "
             "click Submit. Submissions are final. There's no editing afterward. "
             "Right after submitting, you'll be asked a few short reflection "
-            "questions. Please answer honestly."
+            "questions. That's the actual research data this study is collecting, "
+            "so please answer honestly."
         ),
     },
 ]
@@ -1431,7 +1450,7 @@ def page_survey_results():
     c4.metric("Avg. context relevance", f"{survey_df['context_relevance_rating'].mean():.1f} / 5")
 
     st.subheader("Raw responses")
-    st.caption("One row per submission this was answered for - joinable against the feedback "
+    st.caption("One row per submission this was answered for -- joinable against the feedback "
                "table's MAE evaluation on (username, forecast_date).")
     st.dataframe(survey_df, hide_index=True, width="stretch")
     st.download_button(
@@ -1442,7 +1461,7 @@ def page_survey_results():
     )
 
     st.subheader("Experience profile per expert")
-    st.caption("Answered once per user, on their first submission - a moderator variable, "
+    st.caption("Answered once per user, on their first submission -- a moderator variable, "
                "not something that changes day to day.")
     profiles_df = load_all_user_profiles()
     if profiles_df.empty:
