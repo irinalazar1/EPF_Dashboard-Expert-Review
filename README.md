@@ -1,5 +1,7 @@
 # EPF Expert Review (RLHF)
 
+**Live**: [epfdashboard-expert-review-rlhf.streamlit.app](https://epfdashboard-expert-review-rlhf.streamlit.app/)
+
 A Streamlit dashboard for human-in-the-loop review of day-ahead electricity
 price forecasts for the Belgian market. Domain experts adjust a neural
 network's forecast by dragging the curve on a chart, rate their confidence,
@@ -16,28 +18,29 @@ Forked from Margarida Mascarenhas's
 to bootstrap the initial app, using the Belgian data bundled in that repo
 to mimic her DNN forecast results as a starting point. That local-data
 dependency was later removed in favor of pulling data directly and live
-from a separate repo,
-[`DAM_Forecast_V4`](https://github.com/margaridamascarenhas/DAM_Forecast_V4)
-— the current and only live data source (see Architecture below). The fork
-also vendored [epftoolbox](https://github.com/jeslago/epftoolbox)
-(Lago et al., *Applied Energy* 2021), the library that originally produced
-the DNN/LEAR forecasts; that code has since been deleted from this project
-too, since the review app never imported it directly. Cite that paper if
-any result from that lineage reaches a publication.
+from a private data repository (see Architecture below) — none of the
+forked repo's code is used today, only its data initially, to mock results
+during early development. The fork also vendored
+[epftoolbox](https://github.com/jeslago/epftoolbox) (Lago et al., *Applied
+Energy* 2021), the library that originally produced the DNN/LEAR
+forecasts; that code has since been deleted from this project too, since
+the review app never imported it directly.
 
 ## Architecture
 
 - **`app.py`** — the Streamlit app: auth, theming, all five pages.
-- **`db.py`** — SQLite persistence (`epf_dashboard.db`, auto-created).
+- **`db.py`** — Postgres persistence (hosted on Supabase, connected via
+  `DATABASE_URL`; schema managed through pgAdmin).
 - **`draggable_curve/`** — custom React/TypeScript component (built with
   Vite) rendering the forecast chart as one drag-to-edit widget: forecast
   line, uncertainty band, flagged points, all in one view.
-- **Data** — fetched directly from GitHub's raw-content URLs at runtime and
-  parsed straight into memory (`requests` → `io.StringIO` → `pandas`, cached
-  30 min via `st.cache_data`). Nothing is ever saved to a local folder in
-  this repo:
-  - `raw.githubusercontent.com/margaridamascarenhas/DAM_Forecast_V4/main/Forecast/DNN_forecasts_10AM.csv`
-  - `raw.githubusercontent.com/margaridamascarenhas/DAM_Forecast_V4/main/datasets/Data_BE_UTC.csv`
+- **Data** — fetched at runtime from a private GitHub repo (two CSVs: the
+  DNN forecast and realized market data), authenticated via `GITHUB_TOKEN`
+  and parsed straight into memory (`requests` → `io.StringIO` → `pandas`,
+  cached 30 min via `st.cache_data`). Nothing is ever saved to a local
+  folder in this repo. Exact repo/path names are intentionally omitted
+  here since this is a public README — see the `GITHUB_OWNER`/`GITHUB_REPO`
+  constants in `app.py` if you have legitimate access.
 
 ## Project structure
 
@@ -46,8 +49,7 @@ any result from that lineage reaches a publication.
 ├── app.py
 ├── db.py
 ├── requirements.txt
-├── .env
-├── epf_dashboard.db            # created automatically on first run
+├── .env / .env.example
 └── draggable_curve/
     ├── __init__.py
     └── frontend/
@@ -64,7 +66,7 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
 # 2. Environment variables
-cp .env.example .env   # then fill in GITHUB_TOKEN
+cp .env.example .env   # then fill in GITHUB_TOKEN and DATABASE_URL
 
 # 3. Build the drag-to-edit component (one-time; only needs Node for this step)
 cd draggable_curve/frontend && npm install && npm run build && cd ../..
@@ -73,9 +75,19 @@ cd draggable_curve/frontend && npm install && npm run build && cd ../..
 streamlit run app.py
 ```
 
-The database and all tables are created automatically on first run.
-Self-registration only creates `expert` accounts — insert an `admin` row
-directly into `users` (bcrypt-hash the password first) to create one.
+`DATABASE_URL` points to a Postgres instance (this project runs on
+[Supabase](https://supabase.com); any Postgres host works). Tables are
+created automatically on first run against whatever database it points
+to — nothing is bundled locally. Self-registration only creates `expert`
+accounts — insert an `admin` row directly into `users` (bcrypt-hash the
+password first) to create one.
+
+## Deployment
+
+Hosted on Streamlit Community Cloud. Secrets (`GITHUB_TOKEN`,
+`DATABASE_URL`) are set there, not committed. Community Cloud only runs
+`pip install`, no `npm build` — `draggable_curve/frontend/dist/` must
+already be built and committed before pushing.
 
 ## Roles & pages
 
@@ -92,15 +104,15 @@ directly into `users` (bcrypt-hash the password first) to create one.
 | Expert Scoreboard (admin) | Aggregated MAE improvement, win rate, per expert. |
 | Survey Results (admin) | Reflection-survey data + experience profiles; CSV export. |
 
-## Data model (SQLite)
+## Data model (Postgres)
 
 | Table | Purpose |
 |---|---|
 | `users` | Username, email, bcrypt hash, role. |
-| `feedback` | One row per 15-min slot per submission: forecast, adjusted, flagged, confidence. |
+| `submissions` | One row per 15-min slot per submission: forecast, adjusted, flagged, confidence. |
 | `onboarding_status` | Research-disclaimer consent + tutorial completion, gates all access. |
 | `user_profile` | Self-reported EPF experience, asked once per user. |
-| `submission_survey` | Reflection-survey ratings per submission, joinable against `feedback` on `(username, forecast_date)`. |
+| `submission_survey` | Reflection-survey ratings per submission, joinable against `submissions` on `(username, forecast_date)`. |
 
 ## The uncertainty band
 
