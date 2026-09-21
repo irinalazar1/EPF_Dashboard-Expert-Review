@@ -43,8 +43,9 @@ PAGES
 
 THEMING
 -------
-apply_theme() injects CSS; themed() applies a matching Plotly template --
-both keyed off the same dark/light toggle, so nothing falls out of sync.
+Dark mode only. apply_theme() injects CSS; themed() applies a matching
+Plotly template -- both read the same get_palette(), so nothing falls
+out of sync.
 """
 
 import streamlit as st
@@ -80,13 +81,14 @@ load_dotenv()
 # --------------------------------------------------------------------------
 # CACHED DB READS
 #
-# The draggable chart triggers a full st.rerun() on every drag release, and
-# has_submitted()/load_submissions() were being called uncached on each of
-# those reruns -- a live Postgres round-trip per drag. A short TTL removes
-# that from the hot path; correctness doesn't suffer because (a) the
-# submissions_unique_slot DB constraint is the real backstop against a
-# double submit regardless of cache staleness, and (b) both caches are
-# cleared the moment a submission actually saves, below.
+# Several DB-touching functions were being called uncached on every rerun --
+# not just the review page's drag reruns, but literally every rerun of the
+# whole app (get_onboarding_status() runs unconditionally in main(), before
+# routing to any page). Short TTLs remove that from the hot path;
+# correctness doesn't suffer because each cache is cleared the moment the
+# underlying write actually happens, below, and the submissions_unique_slot
+# DB constraint is the real backstop against a double submit regardless of
+# cache staleness.
 # --------------------------------------------------------------------------
 
 @st.cache_data(ttl=15)
@@ -100,6 +102,25 @@ def _cached_load_submissions(expert_id=None, forecast_date=None):
     avoids pulling the whole submissions table just to restore one
     in-progress session (see load_submissions() in db.py)."""
     return load_submissions(expert_id, forecast_date)
+
+
+@st.cache_data(ttl=30)
+def _cached_get_onboarding_status(username):
+    """main() calls get_onboarding_status() unconditionally, before routing
+    to ANY page -- so uncached, it was a live Postgres round-trip on every
+    single rerun of the entire app (every page, every click, every drag),
+    not just the review page. Cleared the moment onboarding is actually
+    completed, in render_onboarding() below, so the gate lifts immediately
+    rather than waiting out the TTL."""
+    return get_onboarding_status(username)
+
+
+@st.cache_data(ttl=30)
+def _cached_load_users():
+    """load_users() was uncached and called on every admin rerun of the
+    review page (every drag) plus every login/register click. Cleared in
+    auth_screen() right after a new account is created."""
+    return load_users()
 
 st.set_page_config(page_title='EPF Expert Review', layout='wide')
 st.title('Electricity Price Forecasting - RLHF')
@@ -127,57 +148,39 @@ EXPERT_ROLES = ["expert"]  # roles selectable at self-registration (no public ad
 
 
 # --------------------------------------------------------------------------
-# THEME (dark / light mode toggle)
+# THEME (dark mode only)
 #
 # get_palette() is the single source of truth for both layers below:
 #   - apply_theme() uses it to inject CSS that themes Streamlit's own chrome
 #     (sidebar, buttons, inputs, popovers, calendar, icons, etc.)
 #   - themed() uses it to give every Plotly chart matching colors, so charts
 #     never look out of sync with the rest of the page.
+# A light-mode toggle/palette used to exist here; removed by request -- the
+# app is dark-only now, so there's nothing left to keep in sync.
 # --------------------------------------------------------------------------
 
 
-def get_palette(dark: bool) -> dict:
+def get_palette() -> dict:
     """Single source of truth for theme colors, shared by the injected CSS
     and the Plotly charts, so both layers always agree on what's readable."""
-    if dark:
-        return {
-            "bg": "#0e1117",
-            "bg_secondary": "#161b22",
-            "sidebar_bg": "#161b22",
-            "card_bg": "#1c222b",
-            "text": "#e6edf3",
-            "text_muted": "#9aa5b1",
-            "border": "#2d3540",
-            "grid": "#2d3540",
-            "input_bg": "#1c222b",
-            "accent": "#6366f1",
-            "accent_text": "#ffffff",
-        }
     return {
-        "bg": "#ffffff",
-        "bg_secondary": "#f6f7f9",
-        "sidebar_bg": "#f6f7f9",
-        "card_bg": "#ffffff",
-        "text": "#1f2328",
-        "text_muted": "#57606a",
-        "border": "#d7dbe0",
-        "grid": "#e3e6ea",
-        "input_bg": "#ffffff",
-        "accent": "#4f46e5",
+        "bg": "#0e1117",
+        "bg_secondary": "#161b22",
+        "sidebar_bg": "#161b22",
+        "card_bg": "#1c222b",
+        "text": "#e6edf3",
+        "text_muted": "#9aa5b1",
+        "border": "#2d3540",
+        "grid": "#2d3540",
+        "input_bg": "#1c222b",
+        "accent": "#6366f1",
         "accent_text": "#ffffff",
     }
 
 
 def apply_theme():
-    """Renders the dark/light toggle in the sidebar and injects matching CSS.
-    Dark mode is the default. Call this once, first thing, in main()."""
-    if "dark_mode" not in st.session_state:
-        st.session_state["dark_mode"] = True  # dark mode by default
-
-    st.sidebar.toggle("🌙 Dark mode", key="dark_mode")
-    dark = st.session_state["dark_mode"]
-    palette = get_palette(dark)
+    """Injects the (dark-only) theme CSS. Call this once, first thing, in main()."""
+    palette = get_palette()
 
     st.markdown(
         f"""
@@ -248,7 +251,7 @@ def apply_theme():
         /* Selectbox/radio dropdown menus render in a portal attached to
            <body>, outside the sidebar/app containers above, so they need
            their own rule or their text is invisible against the popup's
-           own background in light mode. */
+           own background. */
         div[data-baseweb="popover"], div[data-baseweb="menu"], ul[role="listbox"] {{
             background-color: {palette['card_bg']} !important;
         }}
@@ -306,25 +309,37 @@ def apply_theme():
             background-color: {palette['accent']} !important;
             border-color: {palette['accent']} !important;
         }}
+        /* The (?) help-tooltip icon next to metrics/sliders/etc. Verified
+        against the actual rendered DOM: Streamlit's real testid here is
+        "stTooltipHoverTarget", not "stTooltipIcon" (a stale/incorrect
+        selector that never matched anything, in any Streamlit version
+        tested) -- so this icon was silently falling back to Streamlit's
+        own default stroke color, a dark charcoal meant for a light
+        background. On this app's dark background that reads as a faint,
+        low-contrast smudge -- easy to mistake for a plain dot rather than
+        a "?". Setting a real, theme-matched stroke color that actually
+        targets the element fixes that. */
+        [data-testid="stTooltipHoverTarget"] svg {{
+            fill: none !important;
+            stroke: {palette['text_muted']} !important;
+        }}
         </style>
         """,
         unsafe_allow_html=True,
     )
-    return dark
 
 
 def current_plotly_template():
-    """Plotly template name matching the active dark/light toggle state."""
-    return "plotly_dark" if st.session_state.get("dark_mode", True) else "plotly_white"
+    """Plotly template name. Dark-only app, so this is always "plotly_dark"."""
+    return "plotly_dark"
 
 
 def themed(figure):
-    """Applies the current dark/light template and makes the chart background
+    """Applies the dark Plotly template and makes the chart background
     transparent so it blends with the page. Text, legend, and gridline colors
     are set explicitly (not just left to the template default) so they can
-    never end up washed out or invisible in either mode."""
-    dark = st.session_state.get("dark_mode", True)
-    palette = get_palette(dark)
+    never end up washed out or invisible."""
+    palette = get_palette()
 
     figure.update_layout(
         template=current_plotly_template(),
@@ -498,10 +513,16 @@ def get_aci_margin(dnn_df, be_df, alpha=0.2, gamma=0.01, calibration_days=30, mi
     return float(q) if q is not None else None
 
 
+@st.cache_data(ttl=3600)  # holidays never change intra-session; long TTL just bounds process memory
 def get_calendar_context(forecast_date):
     """Belgian holiday/bridge-day context -- both are known drivers of
     unusual demand/price shapes. A "bridge day" is a working day between a
-    holiday and a weekend, often behaving like a de facto holiday."""
+    holiday and a weekend, often behaving like a de facto holiday.
+
+    Was rebuilding a holidays.Belgium() calendar object from scratch on
+    every rerun of the review page (every drag release) -- pure CPU work,
+    no DB involved, but still real per-rerun cost for something that never
+    changes."""
     be_holidays = holidays.Belgium(years=[forecast_date.year - 1, forecast_date.year, forecast_date.year + 1])
     is_holiday = forecast_date in be_holidays
 
@@ -643,8 +664,7 @@ def render_chart_legend(show_forecast=True, show_band=True, show_flagged=True):
     (static Plotly chart) look consistent. Plotly's native legend is off in
     make_comparison_chart() in favor of this; kept in sync by hand with
     DraggableCurve.tsx's version, not shared code."""
-    dark = st.session_state.get("dark_mode", True)
-    palette = get_palette(dark)
+    palette = get_palette()
 
     items = ['<span style="display:flex;align-items:center;gap:5px;">'
              '<span style="width:14px;height:3px;background:#6366f1;display:inline-block;border-radius:1px;"></span>'
@@ -671,9 +691,8 @@ def make_history_chart(history_df):
     """DNN vs. actual over a multi-day window, matching Margarida's
     dashboard_app.py look (terracotta line, unified hover, range slider) --
     but 'Actual' uses the theme's own text color instead of her hardcoded
-    near-black, so it stays visible in dark mode."""
-    dark = st.session_state.get("dark_mode", True)
-    palette = get_palette(dark)
+    near-black, so it stays visible against the dark background."""
+    palette = get_palette()
 
     figure = go.Figure()
     figure.add_trace(go.Scatter(x=history_df["DateTime"], y=history_df["actual"],
@@ -760,13 +779,22 @@ def render_submission_survey(expert_id, forecast_date, survey_key):
                 value="Some familiarity",
             )
 
-        usability = st.slider("How easy was it to use this application for this task?", 1, 5, 3)
-        comprehension = st.slider(
-            "How well did you understand the forecast chart and uncertainty band (shaded region)?", 1, 5, 3
+        usability = st.slider(
+            "How easy was it to use this application for this task?", 
+            1, 5, 3,
+            help="1 = Very difficult | 5 = Very easy"
         )
+
+        comprehension = st.slider(
+            "How well did you understand the forecast chart and uncertainty band (shaded region)?", 
+            1, 5, 3,
+            help="1 = Did not understand at all | 5 = Understood perfectly"
+        )
+
         context_relevance = st.slider(
             "How useful was the additional context (temperature, humidity, solar/wind) for making your adjustment?",
             1, 5, 3,
+            help="1 = Not at all useful | 5 = Extremely useful"
         )
         comment = st.text_area("Anything else you'd like to share about this session? (optional)", height=80)
 
@@ -804,7 +832,10 @@ def page_review_and_adjust():
     with st.sidebar:
         if current_role == "admin":
             # Admins pick which expert's work to view; experts only ever see their own.
-            users = load_users()
+            # Cached: this reruns on every drag release, and a 30s-stale
+            # expert list is harmless here (unlike at login/registration,
+            # where correctness matters more than speed -- see auth_screen()).
+            users = _cached_load_users()
             expert_list = [u for u, d in users.items() if d["role"] == "expert"]
             expert_id = st.selectbox("Expert ID (Admin View)", expert_list) if expert_list else None
         else:
@@ -832,7 +863,7 @@ def page_review_and_adjust():
     imputed_flags = dnn_imputed_flags(forecast_date, dnn_df)
     if imputed_flags is not None and imputed_flags.any():
         st.warning(
-            f"⚠️ This forecast run failed for {forecast_date} — the previous day's forecast was "
+            f"⚠️ This forecast run failed for {forecast_date}. The previous day's forecast was "
             "carried forward. Treat this forecast with extra caution."
         )
 
@@ -996,8 +1027,8 @@ def page_review_and_adjust():
         with st.container(border=True):
             st.subheader("Solar & Wind - Renewables")
             sc1, sc2 = st.columns(2)
-            show_solar = sc1.toggle("☀️ Solar", value=True)
-            show_wind = sc2.toggle("💨 Wind", value=True)
+            show_solar = sc1.toggle("Solar", value=True)
+            show_wind = sc2.toggle("Wind", value=True)
 
             wind_total = day_rows["Wind_Offshore_BE"] + day_rows["Wind_Onshore_BE"]
             solar_vals = day_rows["Solar_BE"].values if show_solar else None
@@ -1038,7 +1069,7 @@ def page_review_and_adjust():
     # asked every time via the separate "submissions" table.
     if is_read_only or already_submitted:
         if is_read_only:
-            st.info(f"Viewing {expert_id}'s submission (read-only — admins cannot submit on behalf of experts).")
+            st.info(f"Viewing {expert_id}'s submission (read-only, admins cannot submit on behalf of experts).")
         elif st.session_state.get(survey_key, False) and not has_completed_survey(expert_id):
             render_submission_survey(expert_id, forecast_date, survey_key)
         else:
@@ -1104,6 +1135,29 @@ def page_reveal_and_evaluate():
     compare forecast vs. adjusted against the realized price (MAE each)."""
     st.title("Reveal & Evaluate")
 
+    with st.expander("What is this page showing?"):
+        st.write(
+            "This page grades one expert's adjustment for one day, but only "
+            "once that day has settled. A delivery day settles the moment "
+            "its real, realized day-ahead price becomes known, which is "
+            "always the day before delivery, so a day can't be graded until "
+            "then."
+        )
+        st.write(
+            "Once it's settled, both the original DNN forecast and the "
+            "expert's dragged, adjusted version are compared against that "
+            "real price using MAE (mean absolute error, in EUR/MWh): the "
+            "average, across the day's 96 fifteen-minute slots, of how far "
+            "off each line was. Lower MAE means a more accurate line."
+        )
+        st.write(
+            "Forecast MAE is the model's own error, unaffected by the "
+            "expert. Adjusted MAE is the expert's edited line's error. If "
+            "Adjusted MAE is lower, the expert's changes made the forecast "
+            "more accurate for that day; if it's higher, the changes made "
+            "it worse."
+        )
+
     log = _cached_load_submissions()
     if log.empty:
         st.warning("No submissions yet.")
@@ -1117,7 +1171,7 @@ def page_reveal_and_evaluate():
 
     last_evaluable = get_last_evaluable_ts()
     if pd.Timestamp(forecast_date) > last_evaluable:
-        st.info("This delivery day's day-ahead prices haven't settled yet — nothing to reveal.")
+        st.info("This delivery day's day-ahead prices haven't settled yet, so there is nothing to reveal.")
         return
 
     submission = (
@@ -1180,6 +1234,33 @@ def page_expert_scoreboard():
     a per-expert leaderboard -- avg. MAE improvement, days reviewed, win
     rate, avg. confidence."""
     st.title("Expert Scoreboard")
+
+    with st.expander("What is this page showing?"):
+        st.write(
+            "This aggregates the same per-day MAE comparison used on Reveal "
+            "& Evaluate, across every settled day each expert has reviewed, "
+            "into one leaderboard row per expert."
+        )
+        st.write(
+            "Avg. improvement is the mean, across that expert's settled "
+            "days, of (Forecast MAE minus Adjusted MAE) in EUR/MWh. A "
+            "positive number means their adjustments made the forecast "
+            "more accurate on average; a negative number means the "
+            "opposite."
+        )
+        st.write(
+            "Days reviewed counts distinct settled days this expert's "
+            "numbers are based on. Win rate is the percentage of those days "
+            "where the expert's adjustment beat the model (Adjusted MAE "
+            "lower than Forecast MAE). Avg. confidence is the mean of the "
+            "expert's own self-reported confidence rating (1 to 5) on "
+            "those same days."
+        )
+        st.write(
+            "Unsettled days are left out entirely until their real price "
+            "is known, so a day never counts toward these numbers before "
+            "it can actually be graded."
+        )
 
     log = _cached_load_submissions()
     if log.empty:
@@ -1294,8 +1375,7 @@ ONBOARDING_STEPS = [
             "Once you're happy with your adjustment, rate how confident you are and "
             "click Submit. Submissions are final. There's no editing afterward. "
             "Right after submitting, you'll be asked a few short reflection "
-            "questions. That's the actual research data this study is collecting, "
-            "so please answer honestly."
+            "questions. Please answer honestly."
         ),
     },
 ]
@@ -1343,6 +1423,7 @@ def render_onboarding(username):
     if next_col.button(next_label, disabled=not consent_given, key=f"onboarding_next_{username}_{step_idx}"):
         if is_last:
             save_onboarding_status(username, True, True, dt.datetime.now(dt.timezone.utc).isoformat())
+            _cached_get_onboarding_status.clear()  # lift the gate immediately, not after the TTL
             del st.session_state[step_idx_key]
         else:
             st.session_state[step_idx_key] += 1
@@ -1354,9 +1435,8 @@ def render_success_banner(message):
     st.success(): apply_theme()'s [data-testid="stAlert"] override (needed
     for consistent info/warning/error theming) also flattens Streamlit's
     own green styling, since all four alert types share that testid."""
-    dark = st.session_state.get("dark_mode", True)
-    text_color = "#4ade80" if dark else "#15803d"
-    bg_color = "rgba(34,197,94,0.15)" if dark else "rgba(34,197,94,0.12)"
+    text_color = "#4ade80"
+    bg_color = "rgba(34,197,94,0.15)"
     st.markdown(
         f'<div style="background-color:{bg_color};border:1px solid #22c55e;'
         f'border-radius:8px;padding:0.75rem 1rem;color:{text_color};font-weight:500;">'
@@ -1412,14 +1492,35 @@ def auth_screen():
                 st.error("This email address is already registered. Please use another or log in.")
             else:
                 save_new_user(username_input, hash_password(new_pass), email_input, new_role)
+                _cached_load_users.clear()  # so the admin's expert-picker sees this account right away
                 st.success("Account created successfully! You can now switch to the Log In option.")
 
 
 def page_dnn_history():
     """DNN-only slice of Margarida's Section 1 chart, natively rendered in
-    this app's own theme -- not her scatter diagnostics or MAE tables."""
-    st.title("Deterministic Forecast Analysis — DNN")
+    this app's own theme -- not her scatter diagnostics or MAE tables. The
+    plot design itself is adapted from her public Hugging Face Space; see
+    the explanatory text below for the link and what the chart means."""
+    st.title("Deterministic Forecast Analysis, DNN")
     st.caption("DNN forecast vs. actual settled price, last 14 days.")
+
+    st.markdown(
+        "This chart's design is taken directly from "
+        "[Margarida's DAM price forecast Space on Hugging Face]"
+        "(https://huggingface.co/spaces/EDS-lab/DAM-price-forecast), "
+        "the source of the underlying DNN model shown here. "
+        "The model is a deep neural network trained to forecast the "
+        "Belgian day-ahead electricity price. It is retrained and run "
+        "on a daily schedule because day-ahead prices have to be "
+        "forecast before each day's auction closes, so a new forecast "
+        "is published every day for the next delivery day. "
+        "The chart below compares that forecast against the price that "
+        "actually settled, once it's known, over the last 14 days. It "
+        "is a rolling accuracy check on the model itself, independent "
+        "of any expert's manual adjustments, and it's what the review "
+        "page's forecast (and its uncertainty band) are ultimately "
+        "built on."
+    )
 
     dnn_df = get_dnn_df()
     be_df = get_be_df()
@@ -1438,6 +1539,38 @@ def page_survey_results():
     profiles. Summaries + raw-data export only -- no analysis here."""
     st.title("Survey Results")
 
+    with st.expander("What is this page showing?"):
+        st.write(
+            "This page isn't about forecast accuracy. It's about the app "
+            "itself: after an expert's first-ever submission, they're "
+            "asked a short reflection survey on how usable and "
+            "understandable the tool was, and whether the extra weather "
+            "and renewables context actually helped them adjust the "
+            "forecast."
+        )
+        st.write(
+            "The four numbers at the top are plain averages of the 1 to 5 "
+            "ratings across every response collected so far. Usability and "
+            "comprehension speak to whether the tool itself got in the "
+            "way; context relevance speaks to whether the extra data "
+            "shown alongside the chart was actually useful, or just "
+            "decoration."
+        )
+        st.write(
+            "Each row in Raw responses is one reflection answer, tied to "
+            "the submission it followed. It can be joined, on username "
+            "and forecast date, to that same submission's MAE result from "
+            "Reveal & Evaluate or the Scoreboard, so a low usability "
+            "rating can be checked against whether that expert's "
+            "adjustment actually helped or hurt the forecast."
+        )
+        st.write(
+            "Experience profile is a separate, one-time question (prior "
+            "familiarity with electricity price forecasting), asked only "
+            "on an expert's first submission, since it describes the "
+            "person rather than any single day's forecast."
+        )
+
     survey_df = load_submission_survey()
     if survey_df.empty:
         st.info("No survey responses submitted yet.")
@@ -1450,7 +1583,7 @@ def page_survey_results():
     c4.metric("Avg. context relevance", f"{survey_df['context_relevance_rating'].mean():.1f} / 5")
 
     st.subheader("Raw responses")
-    st.caption("One row per submission this was answered for -- joinable against the feedback "
+    st.caption("One row per submission this was answered for, joinable against the feedback "
                "table's MAE evaluation on (username, forecast_date).")
     st.dataframe(survey_df, hide_index=True, width="stretch")
     st.download_button(
@@ -1461,8 +1594,8 @@ def page_survey_results():
     )
 
     st.subheader("Experience profile per expert")
-    st.caption("Answered once per user, on their first submission -- a moderator variable, "
-               "not something that changes day to day.")
+    st.caption("Answered once per user, on their first submission, since it's a moderator "
+               "variable, not something that changes day to day.")
     profiles_df = load_all_user_profiles()
     if profiles_df.empty:
         st.info("No experience-level responses yet.")
@@ -1488,7 +1621,7 @@ def main():
     current_user = st.session_state["logged_in_user"]
     current_role = st.session_state["role"]
 
-    consented, completed_tutorial = get_onboarding_status(current_user)
+    consented, completed_tutorial = _cached_get_onboarding_status(current_user)
     if not (consented and completed_tutorial):
         render_onboarding(current_user)
         return
