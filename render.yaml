@@ -1,0 +1,17 @@
+# Render "Blueprint" config: lets Render pick up this whole setup
+# automatically when you connect the repo, instead of clicking through
+# each setting by hand. Uses the same Dockerfile as the Fly.io option, so
+# nothing about the app itself changes based on which host you pick.
+services:
+  - type: web
+    name: epf-expert-review
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter          # smallest paid tier: always-on, no cold-start sleep (~$7/mo)
+    region: frankfurt       # closest Render region to Belgium/Supabase EU projects
+    healthCheckPath: /_stcore/health
+    envVars:
+      - key: DATABASE_URL
+        sync: false         # set manually in the Render dashboard, never committed to git
+      - key: GITHUB_TOKEN
+        sync: false

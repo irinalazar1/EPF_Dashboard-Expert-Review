@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.env
+.git/
+.gitignore
+module_split_wip/
+draggable_curve.zip
+*.ipynb
+diagnose_*.py
+.venv
