@@ -1348,7 +1348,7 @@ ONBOARDING_STEPS = [
         "title": "Reading the chart",
         "body": (
             "The main chart shows the model's forecast as a line, with a shaded band "
-            "around it -- an 80% confidence interval, meaning the real price is "
+            "around it; an 80% confidence interval, meaning the real price is "
             "expected to land inside it about 80% of the time. Points shown in orange "
             "are ones the model itself flagged as unusual for that particular day (5th/95th percentile)."
         ),
