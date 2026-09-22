@@ -291,21 +291,25 @@ def apply_theme():
             fill: {palette['text']} !important;
             stroke: {palette['text']} !important;
         }}
-        /* st.toggle's "on" track color, verified against the actual rendered
-        DOM (Streamlit auto-generates these Emotion class names -- no stable
-        data-testid/role/aria attribute exists for this element, unlike
-        every other rule in this stylesheet). Tied to this Streamlit
-        version's build; if a future `pip install --upgrade streamlit`
-        reverts this to red, re-inspect a toggled-on switch in devtools and
-        swap in whatever class names it shows then. */
-        .st-emotion-cache-1bkesb7.ew2p8o5 {{
+        /* Checkbox, toggle, and radio "selected" color. Streamlit's own
+        React Aria-based widgets leave a checked/selected control's fill
+        color to Streamlit's stock theme (#FF4B4B red) unless overridden --
+        so without this rule, a checked checkbox, an "on" toggle, and the
+        selected radio dot (including the sidebar page picker) all show
+        that default red instead of this app's accent color. This used to
+        be targeted via Streamlit's auto-generated Emotion class names, but
+        those are tied to the exact Streamlit build and silently stop
+        matching on any version bump -- which is exactly what happened once
+        already. `data-selected="true"` is a stable attribute Streamlit
+        sets on these widgets itself, so these rules key off that plus each
+        widget's structural position instead. Verified directly against the
+        live rendered DOM (right-click, then Inspect, on a checked/selected
+        element, if this ever needs re-checking). */
+        [data-testid="stCheckbox"] label[data-selected="true"] > div:first-of-type {{
             background-color: {palette['accent']} !important;
             border-color: {palette['accent']} !important;
         }}
-        /* st.radio's selected-dot color (the sidebar page selector) -- same
-        auto-generated-class situation as the toggle rule above, verified
-        the same way. Re-inspect if a Streamlit upgrade reverts this. */
-        .st-emotion-cache-he5m1v.etak9234 {{
+        label[data-testid="stRadioOption"][data-selected="true"] > div:first-of-type > div:first-child {{
             background-color: {palette['accent']} !important;
             border-color: {palette['accent']} !important;
         }}
