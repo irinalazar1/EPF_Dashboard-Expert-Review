@@ -37,6 +37,8 @@ streamlit run app.py
 
 `DATABASE_URL` points to a Postgres instance (this project runs on Supabase; any Postgres host works). Tables are created automatically on first run.
 
+`GMAIL_SENDER_ADDRESS` / `GMAIL_APP_PASSWORD` are optional: once set, experts automatically get an email with their aggregate results after they pass 10 reviewed days. Leave them blank to skip email entirely.
+
 ## Deployment
 
 Hosted on Render as a Docker web service, connected to this repo for auto-deploy on push to `main`. Secrets are set in Render's dashboard, never committed. The database is a separate, always-on Supabase Postgres instance.

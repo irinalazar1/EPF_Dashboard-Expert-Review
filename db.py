@@ -80,6 +80,19 @@ def _get_engine():
 def init_db():
     engine = _get_engine()
     with engine.begin() as conn:
+        # Serializes concurrent init_db() calls (e.g. multiple app workers/
+        # processes starting up at once, which both Render and GitHub
+        # Codespaces can do). Without this, two connections can both pass
+        # a table's "IF NOT EXISTS" check before either has created it,
+        # then collide on Postgres's own internal pg_type catalog and raise
+        # a UniqueViolation despite the IF NOT EXISTS -- a known Postgres
+        # race, not a bug in the CREATE TABLE statements themselves.
+        # pg_advisory_xact_lock() makes the second caller simply wait for
+        # the first instead of racing it, and releases itself automatically
+        # when this transaction commits, so nothing needs to explicitly
+        # unlock it. The number is arbitrary -- any fixed bigint works, it
+        # just has to be the same one every time this app calls it.
+        conn.execute(text("SELECT pg_advisory_xact_lock(727326512)"))
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS users (
                 username TEXT PRIMARY KEY,
@@ -150,6 +163,18 @@ def init_db():
                 context_relevance_rating INTEGER NOT NULL,
                 comment TEXT,
                 timestamp TEXT NOT NULL,
+                FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE
+            )
+        """))
+        # Tracks the last "results" email sent to each expert (see
+        # maybe_send_results_email() in app.py), so the same milestone isn't
+        # re-emailed on every login -- only once per new evaluated day past
+        # the threshold.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS email_notifications (
+                username TEXT PRIMARY KEY,
+                last_emailed_days_reviewed INTEGER NOT NULL DEFAULT 0,
+                last_emailed_at TEXT,
                 FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE
             )
         """))
@@ -333,4 +358,30 @@ def save_onboarding_status(username, consented, completed_tutorial, timestamp):
                     timestamp = EXCLUDED.timestamp
             """),
             {"username": username, "consented": int(consented), "completed_tutorial": int(completed_tutorial), "timestamp": timestamp},
+        )
+
+
+def get_last_emailed_days_reviewed(username):
+    """Returns the days_reviewed count as of the last results email sent to
+    this user (see maybe_send_results_email() in app.py), or 0 if they've
+    never been emailed."""
+    with _get_engine().connect() as conn:
+        row = conn.execute(
+            text("SELECT last_emailed_days_reviewed FROM email_notifications WHERE username = :username"),
+            {"username": username},
+        ).fetchone()
+    return row[0] if row else 0
+
+
+def mark_results_emailed(username, days_reviewed, timestamp):
+    with _get_engine().begin() as conn:
+        conn.execute(
+            text("""
+                INSERT INTO email_notifications (username, last_emailed_days_reviewed, last_emailed_at)
+                VALUES (:username, :days_reviewed, :timestamp)
+                ON CONFLICT (username) DO UPDATE SET
+                    last_emailed_days_reviewed = EXCLUDED.last_emailed_days_reviewed,
+                    last_emailed_at = EXCLUDED.last_emailed_at
+            """),
+            {"username": username, "days_reviewed": int(days_reviewed), "timestamp": timestamp},
         )

@@ -56,6 +56,9 @@ import re
 from collections import deque
 from datetime import timedelta
 
+import smtplib
+from email.mime.text import MIMEText
+
 import bcrypt
 import holidays
 import numpy as np
@@ -70,6 +73,7 @@ from db import (
     get_user_profile, save_user_profile, load_all_user_profiles,
     save_submission_survey, load_submission_survey, has_completed_survey,
     get_onboarding_status, save_onboarding_status,
+    get_last_emailed_days_reviewed, mark_results_emailed,
 )
 from draggable_curve import draggable_curve
 
@@ -144,6 +148,16 @@ BE_DATA_FILE = "Data_BE_UTC.csv"        # Realized price, load, weather, renewab
 STEPS_PER_DAY = 96  # 15-minute resolution: 24h * 4
 
 EXPERT_ROLES = ["expert"]  # roles selectable at self-registration (no public admin signup)
+
+# Results-email notifications (see maybe_send_results_email()): sent via
+# Gmail SMTP using an App Password, not the account password -- see
+# .env.example. Both must be set for sending to actually happen; if either
+# is missing, maybe_send_results_email() no-ops rather than raising, so a
+# missing config never breaks the app for anyone.
+GMAIL_SENDER_ADDRESS = os.getenv("GMAIL_SENDER_ADDRESS")
+GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
+RESULTS_EMAIL_THRESHOLD_DAYS = 10  # send once an expert has *more than* this many evaluated days
+APP_URL = "https://epf-dashboard-expert-review.onrender.com/"  # linked from the results email
 
 
 
@@ -240,6 +254,13 @@ def apply_theme():
             border: 1px solid {palette['border']};
             border-radius: 8px;
         }}
+        /* Fallback only: every success/warning/error/info message in the
+        app is actually rendered through render_banner() (colored per
+        kind, see BANNER_COLORS), not st.success()/st.warning()/etc., so
+        this rule normally never applies. Left in place in case any native
+        Streamlit alert ever shows up (e.g. a library/future code path
+        that isn't routed through render_banner()), so it isn't left
+        unthemed rather than colored wrong. */
         [data-testid="stAlert"] {{
             background-color: {palette['card_bg']};
             color: {palette['text']} !important;
@@ -813,7 +834,7 @@ def render_submission_survey(expert_id, forecast_date, survey_key):
         save_submission_survey(expert_id, forecast_date, usability, comprehension, context_relevance,
                                 comment.strip(), now)
         st.session_state[survey_key] = False
-        render_success_banner("Thanks for the reflection!")
+        render_banner("Thanks for the reflection!", "success")
         st.rerun()
     elif skip_survey:
         st.session_state[survey_key] = False
@@ -848,7 +869,7 @@ def page_review_and_adjust():
 
         available_dates = get_available_dates(dnn_df)
         if not available_dates:
-            st.error("No complete DNN forecast days available yet.")
+            render_banner("No complete DNN forecast days available yet.", "error")
             return
         forecast_date = st.date_input(
             "Forecast date (day d+1)",
@@ -860,15 +881,16 @@ def page_review_and_adjust():
 
     forecast, timestamps = dnn_forecast(forecast_date, dnn_df)
     if forecast is None:
-        st.error(f"No complete DNN forecast for {forecast_date}.")
+        render_banner(f"No complete DNN forecast for {forecast_date}.", "error")
         return
 
     # Warn if this day's forecast is a stale carry-forward from a failed model run.
     imputed_flags = dnn_imputed_flags(forecast_date, dnn_df)
     if imputed_flags is not None and imputed_flags.any():
-        st.warning(
-            f"⚠️ This forecast run failed for {forecast_date}. The previous day's forecast was "
-            "carried forward. Treat this forecast with extra caution."
+        render_banner(
+            f"This forecast run failed for {forecast_date}. The previous day's forecast was "
+            "carried forward. Treat this forecast with extra caution.",
+            "warning",
         )
 
     # ACI margin, not the retired QR model -- see get_aci_margin() for why.
@@ -915,7 +937,7 @@ def page_review_and_adjust():
             show_temp_sidebar = st.toggle("Show Temperature plot")
             show_hum_sidebar = st.toggle("Show Humidity plot")
         else:
-            st.info("Weather/load context not available for this date.")
+            render_banner("Weather/load context not available for this date.", "info")
             show_temp_sidebar = False
             show_hum_sidebar = False
 
@@ -1039,7 +1061,7 @@ def page_review_and_adjust():
             wind_vals = wind_total.values if show_wind else None
 
             if solar_vals is None and wind_vals is None:
-                st.info("Select at least one series to display.")
+                render_banner("Select at least one series to display.", "info")
             else:
                 st.plotly_chart(make_renewables_chart(day_rows["Date"].values, solar=solar_vals, wind=wind_vals),
                                 width="stretch")
@@ -1073,11 +1095,11 @@ def page_review_and_adjust():
     # asked every time via the separate "submissions" table.
     if is_read_only or already_submitted:
         if is_read_only:
-            st.info(f"Viewing {expert_id}'s submission (read-only, admins cannot submit on behalf of experts).")
+            render_banner(f"Viewing {expert_id}'s submission (read-only, admins cannot submit on behalf of experts).", "info")
         elif st.session_state.get(survey_key, False) and not has_completed_survey(expert_id):
             render_submission_survey(expert_id, forecast_date, survey_key)
         else:
-            st.info(f"You've already submitted feedback for {forecast_date}. Submissions are final.")
+            render_banner(f"You've already submitted feedback for {forecast_date}. Submissions are final.", "info")
     else:
         # No form needed: dragging already updates session state and
         # reruns on release, so `working` is current by the time Submit
@@ -1092,13 +1114,13 @@ def page_review_and_adjust():
 
         if submitted:
             if not expert_id:
-                st.error("Error: No Expert ID found.")
+                render_banner("Error: No Expert ID found.", "error")
             elif has_submitted(expert_id, forecast_date):
                 # Guards against a double-submit race (e.g. two tabs open on the same date) --
                 # the fast-path check for the normal case. The DuplicateSubmissionError catch
                 # below is the actual, database-enforced backstop for the rare case where two
                 # near-simultaneous submissions both pass this check before either commits.
-                st.error("A submission already exists for this date. Refresh the page.")
+                render_banner("A submission already exists for this date. Refresh the page.", "error")
             else:
                 rows = working.copy()
                 rows["expert_id"] = expert_id
@@ -1108,16 +1130,23 @@ def page_review_and_adjust():
                 try:
                     save_submission(rows)
                 except DuplicateSubmissionError:
-                    st.error("A submission already exists for this date. Refresh the page.")
+                    render_banner("A submission already exists for this date. Refresh the page.", "error")
                 else:
                     # Invalidate the short-TTL caches so this submission is
                     # immediately visible everywhere (this page's read-only
-                    # branch, admin's Reveal & Evaluate / Scoreboard) instead
-                    # of waiting out the TTL.
+                    # branch, admin's Reveal & Evaluate / Scoreboard, the
+                    # sidebar's results-email countdown) instead of waiting
+                    # out the TTL. (This particular submission won't itself
+                    # change the results-email count today, since it can't
+                    # be "reviewed" until its price settles -- but clearing
+                    # it here keeps that number always correct rather than
+                    # relying on that timing coincidence.)
                     _cached_has_submitted.clear()
                     _cached_load_submissions.clear()
+                    _cached_compute_expert_results_summary.clear()
+                    _refresh_email_progress(expert_id)  # sidebar countdown reflects this submission right away
                     st.session_state[survey_key] = True  # triggers render_submission_survey() on the next render
-                    render_success_banner(f"Forecast submitted for {forecast_date}! Saved {len(rows)} adjusted values.")
+                    render_banner(f"Forecast submitted for {forecast_date}! Saved {len(rows)} adjusted values.", "success")
                     st.rerun()  # forces the page back into the read-only branch above
 
 
@@ -1132,6 +1161,207 @@ def get_last_evaluable_ts(now=None):
     now = now if now is not None else pd.Timestamp.now(tz="Europe/Brussels").tz_localize(None)
     tomorrow_start = now.normalize() + pd.Timedelta(days=1)
     return tomorrow_start - pd.Timedelta(minutes=15)
+
+
+# --------------------------------------------------------------------------
+# RESULTS-EMAIL NOTIFICATIONS
+#
+# Once an expert has more than RESULTS_EMAIL_THRESHOLD_DAYS settled/graded
+# days, they get an email with their current aggregate stats -- checked
+# once per login (see main()), and re-sent only when days_reviewed has
+# actually increased since the last email (tracked in email_notifications).
+# Streamlit has no background scheduler, so "checked on login" is the
+# closest practical approximation of "after every submission, once past
+# the threshold": the count updates the moment a new day settles, but the
+# email itself only goes out the next time that expert opens the app.
+# --------------------------------------------------------------------------
+
+def compute_expert_results_summary(expert_id):
+    """Aggregates this one expert's settled (evaluated) days into the same
+    stats shown on the Expert Scoreboard -- avg. MAE improvement, days
+    reviewed, win rate, avg. confidence. Deliberately mirrors
+    page_expert_scoreboard()'s per-expert aggregation rather than sharing
+    code with it, so a future change to that page can't silently change
+    what gets emailed (or vice versa).
+
+    Returns None if this expert has no settled/evaluable days yet."""
+    log = _cached_load_submissions(expert_id=expert_id)
+    if log.empty:
+        return None
+
+    be_df = get_be_df()
+    last_evaluable = get_last_evaluable_ts()
+
+    results = []
+    for forecast_date, group in log.groupby("forecast_date"):
+        if pd.Timestamp(forecast_date) > last_evaluable:
+            continue  # not settled yet, same rule as Reveal & Evaluate/Scoreboard
+
+        actuals = be_df.loc[be_df["date_only"] == forecast_date, ["Date", "Price"]].rename(
+            columns={"Date": "timestamp_slot", "Price": "actual"}
+        )
+        evaluation = group.merge(actuals, on="timestamp_slot", how="inner").dropna(subset=["actual"])
+        if evaluation.empty:
+            continue
+
+        forecast_mae = (evaluation["forecast"] - evaluation["actual"]).abs().mean()
+        adjusted_mae = (evaluation["adjusted"] - evaluation["actual"]).abs().mean()
+        results.append({
+            "forecast_date": forecast_date,
+            "improvement": forecast_mae - adjusted_mae,
+            "confidence": group["confidence"].iloc[0],
+        })
+
+    if not results:
+        return None
+
+    results_df = pd.DataFrame(results)
+    return {
+        "days_reviewed": int(results_df["forecast_date"].nunique()),
+        "avg_improvement": round(float(results_df["improvement"].mean()), 2),
+        "win_rate": round(float((results_df["improvement"] > 0).mean() * 100), 1),
+        "avg_confidence": round(float(results_df["confidence"].mean()), 1),
+    }
+
+
+def send_results_email(to_email, username, stats):
+    """Sends a plain-text summary of `stats` to `to_email` via Gmail SMTP.
+    Raises on any failure (missing config, auth failure, network error) --
+    the caller, maybe_send_results_email(), is responsible for catching
+    that so a flaky send can never break a page render for the person
+    using the app right now."""
+    if not GMAIL_SENDER_ADDRESS or not GMAIL_APP_PASSWORD:
+        raise RuntimeError("GMAIL_SENDER_ADDRESS / GMAIL_APP_PASSWORD not configured")
+
+    body = (
+        f"Hi {username},\n\n"
+        f"You've now reviewed {stats['days_reviewed']} settled forecast days on the "
+        f"EPF Expert Review app. Here are your current numbers:\n\n"
+        f"  Avg. MAE improvement: {stats['avg_improvement']} EUR/MWh (Forecast MAE minus Adjusted MAE, averaged across your settled days)\n"
+        f"  Win rate: {stats['win_rate']}% (share of your settled days where Adjusted MAE was lower than Forecast MAE)\n"
+        f"  Avg. confidence: {stats['avg_confidence']} / 5 (your own self-reported rating, averaged across those same days)\n\n"
+        f"{APP_URL}\n\n"
+        f"Thank you for taking part in this study. Your reviews are what make this research possible.\n\n"
+        f"EPF Expert Review (automated message, part of the research study)"
+    )
+    msg = MIMEText(body)
+    msg["Subject"] = f"Your EPF Expert Review results ({stats['days_reviewed']} days reviewed)"
+    msg["From"] = GMAIL_SENDER_ADDRESS
+    msg["To"] = to_email
+
+    # STARTTLS on 587 rather than implicit SSL on 465 -- some networks
+    # (VPNs, campus/corporate wifi, certain routers) block 465 outright
+    # while leaving 587 open, and 587+STARTTLS is Gmail's own documented
+    # recommendation for SMTP clients.
+    with smtplib.SMTP("smtp.gmail.com", 587, timeout=15) as server:
+        server.starttls()
+        server.login(GMAIL_SENDER_ADDRESS, GMAIL_APP_PASSWORD)
+        server.sendmail(GMAIL_SENDER_ADDRESS, [to_email], msg.as_string())
+
+
+@st.cache_data(ttl=15)
+def _cached_compute_expert_results_summary(expert_id):
+    """Same short-TTL treatment as _cached_load_submissions: this wraps a
+    per-day groupby/merge over an expert's full submission history.
+    render_email_progress_sidebar() calls it on every single rerun of the
+    app for a logged-in expert (every drag release, every button click,
+    every page switch) -- not just once per login like
+    maybe_send_results_email() -- so leaving it uncached meant redoing
+    that whole aggregation on every rerun. Cleared the moment a new
+    submission is actually saved (page_review_and_adjust()), so the
+    displayed count updates immediately rather than waiting out the TTL."""
+    return compute_expert_results_summary(expert_id)
+
+
+@st.cache_data(ttl=30)
+def _cached_get_last_emailed_days_reviewed(username):
+    """Same treatment as _cached_get_onboarding_status: render_email_progress_sidebar()
+    calls this on every rerun, so left uncached it was a live Postgres
+    round-trip on every single click/drag for every logged-in expert, not
+    just once per login. Cleared the moment a results email is actually
+    sent, in maybe_send_results_email(), so the countdown updates right
+    away rather than waiting out the TTL."""
+    return get_last_emailed_days_reviewed(username)
+
+
+def _refresh_email_progress(username):
+    """Computes this expert's results-email progress and stores it in
+    st.session_state. This is the only place that actually touches the
+    database or recomputes the per-day aggregation for this feature --
+    render_email_progress_sidebar() below only ever reads the stored
+    result, since it's called on every single rerun of the app (including
+    every chart drag, the single most rerun-heavy interaction in the app),
+    and recomputing on a timer there was adding real per-drag latency
+    even with short-TTL caching. Called once at login (see main()), and
+    again only at the two moments these numbers can actually change: a
+    new submission (page_review_and_adjust()) and a results email
+    actually being sent (maybe_send_results_email())."""
+    stats = _cached_compute_expert_results_summary(username)
+    days_reviewed = stats["days_reviewed"] if stats else 0
+    last_emailed = _cached_get_last_emailed_days_reviewed(username)
+    # Mirrors maybe_send_results_email()'s own threshold logic exactly:
+    # the first email needs days_reviewed > RESULTS_EMAIL_THRESHOLD_DAYS
+    # (so day 11, not day 10), every one after that needs a further full
+    # RESULTS_EMAIL_THRESHOLD_DAYS past the last email actually sent.
+    next_target = (
+        RESULTS_EMAIL_THRESHOLD_DAYS + 1 if last_emailed == 0
+        else last_emailed + RESULTS_EMAIL_THRESHOLD_DAYS
+    )
+    st.session_state["email_progress"] = {"days_reviewed": days_reviewed, "next_target": next_target}
+
+
+def render_email_progress_sidebar(username):
+    """Shown in the sidebar for every expert, every page (see main()): how
+    many more reviewed (settled) days remain until their next automatic
+    results email. Pure read from st.session_state -- see
+    _refresh_email_progress() for where and how often that's populated --
+    so this costs nothing extra on an ordinary rerun."""
+    if "email_progress" not in st.session_state:
+        _refresh_email_progress(username)
+    progress = st.session_state["email_progress"]
+    days_reviewed = progress["days_reviewed"]
+    next_target = progress["next_target"]
+    remaining = max(next_target - days_reviewed, 0)
+
+    st.caption(f"Results email: {days_reviewed}/{next_target} reviewed days")
+    st.progress(min(days_reviewed / next_target, 1.0))
+    if remaining > 0:
+        st.caption(f"{remaining} more reviewed day{'s' if remaining != 1 else ''} until your next results email.")
+    else:
+        st.caption("Your next results email will be sent at your next login.")
+
+
+def maybe_send_results_email(username):
+    """Checked once per login (see main()): sends the first results email
+    once this expert passes RESULTS_EMAIL_THRESHOLD_DAYS evaluated days,
+    then a fresh one only every further RESULTS_EMAIL_THRESHOLD_DAYS days
+    after that (milestone-based, e.g. 11, 21, 31...) rather than on every
+    single new evaluated day -- daily emails would themselves be a signal
+    that could influence how an expert reviews, which runs against the
+    same neutral-framing goal as the email's plain, non-judgmental wording.
+    No-ops quietly -- never raises into the page -- if email isn't
+    configured, this expert has no email on file, or the send itself
+    fails; a failed send is retried at their next login since
+    mark_results_emailed() is only called after a successful send."""
+    stats = compute_expert_results_summary(username)
+    if stats is None or stats["days_reviewed"] <= RESULTS_EMAIL_THRESHOLD_DAYS:
+        return
+
+    last_emailed = get_last_emailed_days_reviewed(username)
+    if stats["days_reviewed"] < last_emailed + RESULTS_EMAIL_THRESHOLD_DAYS:
+        return  # not a full milestone past the last email yet
+
+    user_email = _cached_load_users().get(username, {}).get("email")
+    if not user_email:
+        return
+
+    try:
+        send_results_email(user_email, username, stats)
+        mark_results_emailed(username, stats["days_reviewed"], dt.datetime.now(dt.timezone.utc).isoformat())
+        _cached_get_last_emailed_days_reviewed.clear()
+        _refresh_email_progress(username)  # sidebar countdown reflects the new milestone right away
+    except Exception as e:
+        print(f"[results email] failed to send to {username!r}: {e}")
 
 
 def page_reveal_and_evaluate():
@@ -1164,7 +1394,7 @@ def page_reveal_and_evaluate():
 
     log = _cached_load_submissions()
     if log.empty:
-        st.warning("No submissions yet.")
+        render_banner("No submissions yet.", "warning")
         return
 
     be_df = get_be_df()
@@ -1175,7 +1405,7 @@ def page_reveal_and_evaluate():
 
     last_evaluable = get_last_evaluable_ts()
     if pd.Timestamp(forecast_date) > last_evaluable:
-        st.info("This delivery day's day-ahead prices haven't settled yet, so there is nothing to reveal.")
+        render_banner("This delivery day's day-ahead prices haven't settled yet, so there is nothing to reveal.", "info")
         return
 
     submission = (
@@ -1195,7 +1425,7 @@ def page_reveal_and_evaluate():
     evaluation = submission.merge(actuals, on="timestamp_slot", how="inner")
 
     if evaluation.empty:
-        st.info("No realized prices available yet for this date.")
+        render_banner("No realized prices available yet for this date.", "info")
         return
 
     # Some slots can have a matched timestamp but a missing/NaN price -- a
@@ -1206,7 +1436,7 @@ def page_reveal_and_evaluate():
     evaluation = evaluation.dropna(subset=["actual"])
 
     if evaluation.empty:
-        st.info(f"Realized prices for {forecast_date} are missing from the data feed -- nothing to evaluate yet.")
+        render_banner(f"Realized prices for {forecast_date} are missing from the data feed -- nothing to evaluate yet.", "info")
         return
 
     forecast_mae = (evaluation["forecast"] - evaluation["actual"]).abs().mean()
@@ -1214,7 +1444,7 @@ def page_reveal_and_evaluate():
     confidence_rating = submission["confidence"].iloc[0]  # constant across the day's 96 rows
 
     if n_missing_actual > 0:
-        st.caption(f"⚠️ {n_missing_actual} of {STEPS_PER_DAY} slots had a missing realized price and were excluded from these MAE numbers.")
+        st.caption(f"{n_missing_actual} of {STEPS_PER_DAY} slots had a missing realized price and were excluded from these MAE numbers.")
 
     forecast_metric, adjusted_metric, confidence_metric = st.columns(3)
     forecast_metric.metric("Forecast MAE", f"{forecast_mae:.2f} EUR/MWh")
@@ -1268,7 +1498,7 @@ def page_expert_scoreboard():
 
     log = _cached_load_submissions()
     if log.empty:
-        st.warning("No submissions yet.")
+        render_banner("No submissions yet.", "warning")
         return
 
     be_df = get_be_df()
@@ -1307,7 +1537,7 @@ def page_expert_scoreboard():
         })
 
     if not results:
-        st.warning("No submissions overlap with settled actual prices yet.")
+        render_banner("No submissions overlap with settled actual prices yet.", "warning")
         return
 
     results_df = pd.DataFrame(results)
@@ -1382,6 +1612,15 @@ ONBOARDING_STEPS = [
             "questions. Please answer honestly."
         ),
     },
+    {
+        "title": "Your results by email",
+        "body": (
+            "Once a submitted day settles and can be graded, it counts toward your "
+            "reviewed-days total. After you pass 10 reviewed days, you'll automatically "
+            "get an email with your stats so far, and another every 10 reviewed days "
+            "after that."
+        ),
+    },
 ]
 
 
@@ -1403,11 +1642,12 @@ def render_onboarding(username):
 
     consent_given = True
     if step.get("kind") == "consent":
-        st.warning(
+        render_banner(
             "**This application is intended for research purposes.** Your forecast "
             "adjustments, confidence ratings, and survey responses will be used in an "
             "academic study on human-in-the-loop electricity price forecasting. No "
-            "real trading or operational decisions should be based on this tool."
+            "real trading or operational decisions should be based on this tool.",
+            "warning",
         )
         consent_given = st.checkbox(
             "I understand this application is intended for research purposes.",
@@ -1434,17 +1674,32 @@ def render_onboarding(username):
         st.rerun()
 
 
-def render_success_banner(message):
-    """Guaranteed-green success banner, built as plain HTML rather than
-    st.success(): apply_theme()'s [data-testid="stAlert"] override (needed
-    for consistent info/warning/error theming) also flattens Streamlit's
-    own green styling, since all four alert types share that testid."""
-    text_color = "#4ade80"
-    bg_color = "rgba(34,197,94,0.15)"
+BANNER_COLORS = {
+    # One shared visual style (padding, border-radius, font-weight -- see
+    # render_banner()) for every success/warning/error/info message in the
+    # app; only these three values change per kind. Kept as a plain dict
+    # rather than folded into get_palette(), since these are alert-specific
+    # semantic colors, not part of the app's general UI/Plotly palette.
+    "success": {"text": "#4ade80", "border": "#22c55e", "bg": "rgba(34,197,94,0.15)"},
+    "error":   {"text": "#f87171", "border": "#ef4444", "bg": "rgba(239,68,68,0.15)"},
+    "warning": {"text": "#fbbf24", "border": "#f59e0b", "bg": "rgba(245,158,11,0.15)"},
+    "info":    {"text": "#93c5fd", "border": "#3b82f6", "bg": "rgba(59,130,246,0.15)"},
+}
+
+
+def render_banner(message, kind="info"):
+    """Single reusable banner for every success/warning/error/info message
+    in the app, so they all share one visual style and differ only by
+    color, per `kind` (one of BANNER_COLORS' keys). Built as plain HTML
+    rather than st.success()/st.warning()/st.error()/st.info(): those all
+    render through the same [data-testid="stAlert"] testid, so a CSS
+    override can't tell them apart by type -- this replaces reliance on
+    that testid entirely rather than fighting it."""
+    colors = BANNER_COLORS[kind]
     st.markdown(
-        f'<div style="background-color:{bg_color};border:1px solid #22c55e;'
-        f'border-radius:8px;padding:0.75rem 1rem;color:{text_color};font-weight:500;">'
-        f'✅ {message}</div>',
+        f'<div style="background-color:{colors["bg"]};border:1px solid {colors["border"]};'
+        f'border-radius:8px;padding:0.75rem 1rem;color:{colors["text"]};font-weight:500;">'
+        f'{message}</div>',
         unsafe_allow_html=True,
     )
 
@@ -1473,7 +1728,7 @@ def auth_screen():
                 st.session_state["role"] = users[login_user]["role"]
                 st.rerun()
             else:
-                st.error("Invalid username or password.")
+                render_banner("Invalid username or password.", "error")
 
     elif auth_mode == "Create Account":
         new_email = st.text_input("Email Address", key="new_email")
@@ -1489,15 +1744,15 @@ def auth_screen():
             is_valid, validation_message = validate_registration(username_input, email_input, new_pass)
 
             if not is_valid:
-                st.error(validation_message)
+                render_banner(validation_message, "error")
             elif username_input in users:
-                st.error("This username is already taken. Please choose another.")
+                render_banner("This username is already taken. Please choose another.", "error")
             elif email_exists:
-                st.error("This email address is already registered. Please use another or log in.")
+                render_banner("This email address is already registered. Please use another or log in.", "error")
             else:
                 save_new_user(username_input, hash_password(new_pass), email_input, new_role)
                 _cached_load_users.clear()  # so the admin's expert-picker sees this account right away
-                st.success("Account created successfully! You can now switch to the Log In option.")
+                render_banner("Account created successfully! You can now switch to the Log In option.", "success")
 
 
 def page_dnn_history():
@@ -1532,7 +1787,7 @@ def page_dnn_history():
     history_df = get_dnn_history_window(dnn_df, be_df, days=14)
 
     if history_df.empty:
-        st.info("No DNN forecast data available yet.")
+        render_banner("No DNN forecast data available yet.", "info")
         return
 
     st.plotly_chart(make_history_chart(history_df), width="stretch")
@@ -1577,7 +1832,7 @@ def page_survey_results():
 
     survey_df = load_submission_survey()
     if survey_df.empty:
-        st.info("No survey responses submitted yet.")
+        render_banner("No survey responses submitted yet.", "info")
         return
 
     c1, c2, c3, c4 = st.columns(4)
@@ -1602,7 +1857,7 @@ def page_survey_results():
                "variable, not something that changes day to day.")
     profiles_df = load_all_user_profiles()
     if profiles_df.empty:
-        st.info("No experience-level responses yet.")
+        render_banner("No experience-level responses yet.", "info")
     else:
         st.dataframe(profiles_df, hide_index=True, width="stretch")
 
@@ -1630,11 +1885,22 @@ def main():
         render_onboarding(current_user)
         return
 
+    # Results-email check: once per login session (st.session_state persists
+    # across reruns within one browser session, so this runs once after
+    # login, not on every page switch/drag/rerun). Experts only -- admins
+    # never submit, so they'd never have results to report anyway.
+    if current_role == "expert" and not st.session_state.get("results_email_checked"):
+        st.session_state["results_email_checked"] = True
+        maybe_send_results_email(current_user)
+
     with st.sidebar:
         st.write(f"Logged in as: **{current_user}** ({current_role})")
         if st.button("Log Out"):
             st.session_state.clear()
             st.rerun()
+
+        if current_role == "expert":
+            render_email_progress_sidebar(current_user)
 
         st.divider()
 
