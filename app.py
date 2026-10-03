@@ -1,9 +1,6 @@
 """
-EPF Expert Review (RLHF) -- Streamlit dashboard for human-in-the-loop
+EPF Expert Review -- Streamlit dashboard for human-in-the-loop
 review of day-ahead electricity price forecasts for the Belgian market.
-"RLHF" in the UI title reflects the research framing (does human feedback
-improve a model's output); code/variable names still say "EPF Expert
-Review" as the literal description.
 
 WHAT IT DOES
 ------------
@@ -35,7 +32,8 @@ from the DNN's own settled residuals via Adaptive Conformal Inference
 PAGES
 -----
 1. Review & Adjust -- the core workflow above.
-2. Deterministic Forecast Analysis -- DNN vs. actual, last 14 days.
+2. Deterministic Forecast Analysis -- DNN vs. actual, last 14 days
+   (time series + actual-vs-forecast error scatter).
 3. Reveal & Evaluate (admin) -- MAE for one submission once settled.
 4. Expert Scoreboard (admin) -- aggregated MAE improvement per expert.
 5. Survey Results (admin) -- the reflection survey + experience profiles;
@@ -123,7 +121,7 @@ def _cached_load_users():
     return load_users()
 
 st.set_page_config(page_title='EPF Expert Review', layout='wide')
-st.title('Electricity Price Forecasting - RLHF')
+st.title('Electricity Price Forecasting - Expert Review')
 
 
 # --------------------------------------------------------------------------
@@ -548,8 +546,8 @@ def get_calendar_context(forecast_date):
 
 def get_dnn_history_window(dnn_df, be_df, days=14):
     """DNN forecast vs. actual, last `days` days -- windowed the same way
-    as Margarida's dashboard_app.py Section 1, DNN-only (not her scatter
-    diagnostics or MAE tables).
+    as Margarida's dashboard_app.py Section 1, DNN-only (feeds both the
+    time-series chart and the error scatter; not her MAE tables).
 
     Two deliberate, non-obvious choices:
       - Window ends at the latest forecast timestamp, not the latest
@@ -710,6 +708,52 @@ def make_history_chart(history_df):
         xaxis_title="DateTime", yaxis_title="EUR / MWh",
         hovermode="x unified",
         xaxis=dict(rangeslider=dict(visible=True)),
+    )
+    return themed(figure)
+
+
+def make_error_scatter_chart(history_df):
+    """Actual vs. DNN forecast for every settled 15 min slot in the window --
+    adapted from Margarida's plot_scatter_actual_vs_pred() (same axes,
+    same DNN color, size-7 / 0.65-opacity markers), redrawn in this app's
+    theme. Adds a y = x "perfect forecast" line her version doesn't have:
+    each point's vertical distance from it is that slot's error, so points
+    above the line are over-forecasts and points below are under-forecasts.
+    Unsettled slots (no actual yet) are dropped rather than plotted."""
+    palette = get_palette()
+    settled = history_df.dropna(subset=["forecast", "actual"])
+    error = settled["forecast"] - settled["actual"]
+
+    figure = go.Figure()
+    if not settled.empty:
+        lo = float(min(settled["actual"].min(), settled["forecast"].min()))
+        hi = float(max(settled["actual"].max(), settled["forecast"].max()))
+        pad = (hi - lo) * 0.05 or 1.0
+        lo, hi = lo - pad, hi + pad
+        figure.add_trace(go.Scatter(
+            x=[lo, hi], y=[lo, hi], mode="lines", name="Perfect forecast (y = x)",
+            line=dict(color=palette["text_muted"], width=1.5, dash="dash"),
+            hoverinfo="skip",
+        ))
+        figure.update_xaxes(range=[lo, hi])
+        figure.update_yaxes(range=[lo, hi])
+
+    figure.add_trace(go.Scatter(
+        x=settled["actual"], y=settled["forecast"], mode="markers", name="DNN (15-min slots)",
+        marker=dict(size=5, color="#C97B63", opacity=0.65),  # Margarida's DNN color
+        customdata=np.column_stack([settled["DateTime"].dt.strftime("%a %d %b %H:%M"), error]),
+        hovertemplate=(
+            "%{customdata[0]}<br>"
+            "Actual: %{x:.2f} EUR/MWh<br>"
+            "Forecast: %{y:.2f} EUR/MWh<br>"
+            "Error (forecast \u2212 actual): %{customdata[1]:+.2f}<extra></extra>"
+        ),
+    ))
+    figure.update_layout(
+        title=dict(text="Actual vs DNN forecast", x=0.01, xanchor="left", font=dict(size=20)),
+        xaxis_title="Actual (EUR/MWh)", yaxis_title="DNN forecast (EUR/MWh)",
+        legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="right", x=1.0),
+        height=520,
     )
     return themed(figure)
 
@@ -878,15 +922,12 @@ def page_review_and_adjust():
     day_rows = be_df.loc[be_df["date_only"] == forecast_date].sort_values("Date")
 
     # Weather/load context needs the actuals feed caught up to this date.
-    # French demand isn't shown: different scale from Belgium's, not useful
-    # for judging this forecast.
-    #
-    # Net (residual) demand, not gross: price is set by the generator
-    # covering demand AFTER renewables (near-zero marginal cost) are
-    # subtracted, so net demand tracks price in a way gross doesn't.
+    # Net (residual) load, not gross: price is set by the generator
+    # covering load AFTER renewables (near-zero marginal cost) are
+    # subtracted, so net load tracks price in a way gross doesn't.
     if len(day_rows) == STEPS_PER_DAY:
         wind_total_day = day_rows["Wind_Offshore_BE"] + day_rows["Wind_Onshore_BE"]
-        net_demand = (day_rows["Load_BE"] - day_rows["Solar_BE"] - wind_total_day).mean()
+        net_load = (day_rows["Load_BE"] - day_rows["Solar_BE"] - wind_total_day).mean()
         avg_temp = day_rows["temperature_2m"].mean()
         avg_hum = day_rows["relative_humidity_2m"].mean()
         context_available = True
@@ -905,8 +946,8 @@ def page_review_and_adjust():
         st.subheader("Day info")
         if context_available:
             st.metric(
-                "Avg. Net BE demand (MW)", f"{net_demand:,.0f}",
-                help="Gross demand minus solar and wind generation -- the portion of demand "
+                "Avg. Net BE load (MW)", f"{net_load:,.0f}",
+                help="Gross load minus solar and wind generation -- the portion of load "
                      "that has to be covered by other (price-setting) generation.",
             )
             st.metric("Avg. temp (°C)", f"{avg_temp:.1f}")
@@ -922,8 +963,8 @@ def page_review_and_adjust():
     with st.expander("What am I looking at?"):
         st.write(
             "This is the forecast chart for the chosen day. The :blue[shaded band] is an 80% "
-            "confidence interval. Points shown in :orange[orange] are ones the model itself flagged as "
-            "unusual for this particular day. The dashed line is the original, unadjusted "
+            "confidence interval. Points shown in :orange[orange] are the top and bottom 5% of model "
+            "predictions. The dashed line is the original, unadjusted "
             "forecast, useful for seeing how far an adjustment has drifted from it. Points "
             "can be dragged up or down accordingly."
         )
@@ -935,8 +976,14 @@ def page_review_and_adjust():
         )
         st.write(
             ":green[Renewables (Solar, Wind)] during the given day are plotted underneath the "
-            "draggable forecast using their respective slider button. "
-            "Indicate the confidence level in your results before submission."
+            "draggable forecast using their respective slider button."
+        )
+        st.write(
+            "**Submitting your results:** once you're happy with your adjustments, scroll to the "
+            "bottom of this page. In the :violet[***Your confidence***] box, set the slider from 1 "
+            "(no confidence) to 5 (highest confidence), then click :violet[***Submit results***]. "
+            "Submissions are final, so double-check your curve first. If you haven't changed "
+            "anything, submitting records that you agree with the model's forecast as-is."
         )
 
     # Auto-flag: 5th/95th percentile of THIS day's own forecast, not a
@@ -1025,7 +1072,7 @@ def page_review_and_adjust():
         st.caption(f"Current ACI margin: ± {margin:.2f} EUR/MWh")
 
 
-    # Solar+wind share one chart: their combined dip drives net demand and
+    # Solar+wind share one chart: their combined dip drives net load and
     # price spikes.
     if context_available:
         with st.container(border=True):
@@ -1077,7 +1124,7 @@ def page_review_and_adjust():
         elif st.session_state.get(survey_key, False) and not has_completed_survey(expert_id):
             render_submission_survey(expert_id, forecast_date, survey_key)
         else:
-            st.info(f"You've already submitted feedback for {forecast_date}. Submissions are final.")
+            st.info(f"You've already submitted results for {forecast_date}. Submissions are final.")
     else:
         # No form needed: dragging already updates session state and
         # reruns on release, so `working` is current by the time Submit
@@ -1088,7 +1135,7 @@ def page_review_and_adjust():
         with st.container(border=True):
             st.subheader("Your confidence")
             confidence = st.slider("How confident are you in these adjustments? (1-no confidence, 5-highest confidence)", 1, 5, 3)
-            submitted = st.button("Submit feedback")
+            submitted = st.button("Submit results")
 
         if submitted:
             if not expert_id:
@@ -1368,7 +1415,7 @@ ONBOARDING_STEPS = [
     {
         "title": "Using the extra context",
         "body": (
-            "Below the chart you'll find extra information: demand, temperature, "
+            "Below the chart you'll find extra information: load, temperature, "
             "humidity, solar and wind output. That might help you judge whether the "
             "model's forecast makes sense for that particular day."
         ),
@@ -1502,7 +1549,8 @@ def auth_screen():
 
 def page_dnn_history():
     """DNN-only slice of Margarida's Section 1 chart, natively rendered in
-    this app's own theme -- not her scatter diagnostics or MAE tables. The
+    this app's own theme, plus her actual-vs-forecast error scatter (not
+    her MAE tables). The
     plot design itself is adapted from her public Hugging Face Space; see
     the explanatory text below for the link and what the chart means."""
     st.title("Deterministic Forecast Analysis, DNN")
@@ -1536,6 +1584,17 @@ def page_dnn_history():
         return
 
     st.plotly_chart(make_history_chart(history_df), width="stretch")
+
+    st.markdown(
+        "The scatter below shows the same days' errors slot by slot: each "
+        "point is one settled 15-minute slot, with the actual price on the "
+        "x-axis and the DNN forecast on the y-axis. Points on the dashed "
+        "diagonal were forecast exactly; the further a point sits from it, "
+        "the larger that slot's error. Points above the line are slots the "
+        "model over-forecast, points below are slots it under-forecast. "
+        "Slots that haven't settled yet (usually tomorrow) are left out."
+    )
+    st.plotly_chart(make_error_scatter_chart(history_df), width="stretch")
 
 
 def page_survey_results():
