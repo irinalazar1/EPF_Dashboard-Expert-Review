@@ -408,7 +408,7 @@ const DraggableCurve: React.FC<ComponentProps> = (props) => {
         {bandPath && (
           <span style={{ display: "flex", alignItems: "center", gap: 5 }}>
             <span style={{ width: 14, height: 10, background: "rgba(100,100,255,0.35)", display: "inline-block", borderRadius: 2 }} />
-            80% interval (ACI)
+             Likely price range (80%)
           </span>
         )}
         {flagged && (

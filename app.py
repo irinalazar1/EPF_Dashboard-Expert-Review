@@ -594,10 +594,13 @@ def make_simple_chart(timestamps, values, y_title):
     return themed(figure)
 
 
-def make_renewables_chart(timestamps, solar=None, wind=None):
-    """Standalone solar + wind chart -- both in MW, so they share one axis
-    (unlike the main chart's secondary axis, this one doesn't need to share
-    space with a EUR/MWh price series)."""
+def make_renewables_chart(timestamps, solar=None, wind=None, net_load=None):
+    """Standalone solar + wind (+ optional net load) chart -- all in MW, so
+    they share one axis (unlike the main chart's secondary axis, this one
+    doesn't need to share space with a EUR/MWh price series). Net load is an
+    unfilled dotted line, not a filled area: it's the demand left over after
+    renewables, not another generation source, and a third fill would hide
+    the other two."""
     figure = go.Figure()
     if solar is not None:
         figure.add_trace(go.Scatter(
@@ -610,6 +613,11 @@ def make_renewables_chart(timestamps, solar=None, wind=None):
             x=timestamps, y=wind, mode="lines", name="Wind total (MW)",
             line=dict(color="#14b8a6", width=2.5),
             fill="tozeroy", fillcolor="rgba(20,184,166,0.15)",
+        ))
+    if net_load is not None:
+        figure.add_trace(go.Scatter(
+            x=timestamps, y=net_load, mode="lines", name="Net load (MW)",
+            line=dict(color=get_palette()["text"], width=2.5, dash="dot"),
         ))
     ts_min = pd.Timestamp(np.asarray(timestamps).min())
     ts_max = pd.Timestamp(np.asarray(timestamps).max())
@@ -635,7 +643,7 @@ def make_comparison_chart(timestamps, forecast, adjusted, band_lower=None, band_
         figure.add_trace(go.Scatter(x=timestamps, y=band_upper, mode="lines", line=dict(width=0), showlegend=False))
         figure.add_trace(go.Scatter(
             x=timestamps, y=band_lower, mode="lines", line=dict(width=0),
-            fill="tonexty", fillcolor="rgba(100,100,255,0.35)", name="80% interval (ACI)",
+            fill="tonexty", fillcolor="rgba(100,100,255,0.35)", name="Likely price range (80%)",
         ))
 
     figure.add_trace(go.Scatter(x=timestamps, y=forecast, mode="lines", name="DNN Forecast",
@@ -683,7 +691,7 @@ def render_chart_legend(show_forecast=True, show_band=True, show_flagged=True):
     if show_band:
         items.append('<span style="display:flex;align-items:center;gap:5px;">'
                       '<span style="width:14px;height:10px;background:rgba(100,100,255,0.35);display:inline-block;border-radius:2px;"></span>'
-                      '80% interval (ACI)</span>')
+                      'Likely price range (80%)</span>')
     if show_flagged:
         items.append('<span style="display:flex;align-items:center;gap:5px;">'
                       '<span style="width:9px;height:9px;background:#f59e0b;border-radius:50%;display:inline-block;"></span>'
@@ -981,7 +989,10 @@ def page_review_and_adjust():
         )
         st.write(
             ":green[Renewables (Solar, Wind)] during the given day are plotted underneath the "
-            "draggable forecast using their respective slider button."
+            "draggable forecast using their respective slider button. Turn on **Net load** "
+            "to add load minus solar and wind to the same chart: the part of demand that "
+            "other, price-setting generation has to cover. Prices tend to rise when net "
+            "load is high, especially in the evening once solar drops off."
         )
         st.write(
             "**Submitting your results:** once you're happy with your adjustments, scroll to the "
@@ -1070,31 +1081,45 @@ def page_review_and_adjust():
             working["adjusted"] = dragged
             st.session_state[key] = working
             st.rerun()
-
+            
     if margin is None:
-        st.caption("Not enough settled history yet to calibrate an ACI band for this date.")
+        st.caption("Not enough past data yet to estimate a likely price range for this date.")
     else:
-        st.caption(f"Current ACI margin: ± {margin:.2f} EUR/MWh")
+        st.caption(
+            f"Likely price range: the real price usually lands within ± {margin:.2f} EUR/MWh "
+            "of the DNN forecast (about 8 times out of 10)."
+        )
 
 
     # Solar+wind share one chart: their combined dip drives net load and
-    # price spikes.
+    # price spikes. Net load (load - solar - wind, same formula as the
+    # sidebar's daily average) is an opt-in third series on the same axis.
     if context_available:
         with st.container(border=True):
-            st.subheader("Solar & Wind - Renewables")
-            sc1, sc2 = st.columns(2)
+            st.subheader("Solar, Wind & Net Load")
+            sc1, sc2, sc3 = st.columns(3)
             show_solar = sc1.toggle("Solar", value=True)
             show_wind = sc2.toggle("Wind", value=True)
+            show_net_load = sc3.toggle(
+                "Net load", value=False,
+                help="Load minus solar and wind: the part of demand that other "
+                     "(price-setting) generation has to cover.",
+            )
 
             wind_total = day_rows["Wind_Offshore_BE"] + day_rows["Wind_Onshore_BE"]
+            net_load_series = day_rows["Load_BE"] - day_rows["Solar_BE"] - wind_total
             solar_vals = day_rows["Solar_BE"].values if show_solar else None
             wind_vals = wind_total.values if show_wind else None
+            net_load_vals = net_load_series.values if show_net_load else None
 
-            if solar_vals is None and wind_vals is None:
+            if solar_vals is None and wind_vals is None and net_load_vals is None:
                 st.info("Select at least one series to display.")
             else:
-                st.plotly_chart(make_renewables_chart(day_rows["Date"].values, solar=solar_vals, wind=wind_vals),
-                                width="stretch")
+                st.plotly_chart(
+                    make_renewables_chart(day_rows["Date"].values, solar=solar_vals,
+                                          wind=wind_vals, net_load=net_load_vals),
+                    width="stretch",
+                )
 
         # Toggles live in the sidebar; charts render here, full width.
         if show_temp_sidebar and show_hum_sidebar:
@@ -1420,8 +1445,9 @@ ONBOARDING_STEPS = [
     {
         "title": "Using the extra context",
         "body": (
-            "Below the chart you'll find extra information: load, temperature, "
-            "humidity, solar and wind output. That might help you judge whether the "
+            "Below the chart you'll find extra information: temperature, humidity, "
+            "solar and wind output, and net load (demand left after solar and wind) "
+            "over the day. That might help you judge whether the "
             "model's forecast makes sense for that particular day."
         ),
     },
