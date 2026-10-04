@@ -416,7 +416,12 @@ def get_be_df():
     sub-charts on Review & Adjust."""
     # Already a lean 9-column file -- nothing to trim.
     df = fetch_csv_from_github(GITHUB_OWNER, GITHUB_REPO, GITHUB_BRANCH, "datasets", BE_DATA_FILE, GITHUB_TOKEN)
-    df["Date"] = pd.to_datetime(df["Date"])
+    df["Date"] = (
+        pd.to_datetime(df["Date"])
+        .dt.tz_localize("UTC")                 # the file is in UTC
+        .dt.tz_convert("Europe/Brussels")      # same clock as the DNN forecast
+        .dt.tz_localize(None)                  # back to naive, like the rest of the app
+    )
     df["date_only"] = df["Date"].dt.date
     return df.sort_values("Date").reset_index(drop=True)
 
