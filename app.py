@@ -51,6 +51,8 @@ import datetime as dt
 import os
 import io
 import re
+import time
+from zoneinfo import ZoneInfo
 from collections import deque
 from datetime import timedelta
 
@@ -68,6 +70,7 @@ from db import (
     get_user_profile, save_user_profile, load_all_user_profiles,
     save_submission_survey, load_submission_survey, has_completed_survey,
     get_onboarding_status, save_onboarding_status,
+    record_forecast_published, load_forecast_availability,
 )
 from draggable_curve import draggable_curve
 
@@ -136,12 +139,68 @@ GITHUB_OWNER = "margaridamascarenhas"
 GITHUB_REPO = "DAM_Forecast_V4"
 GITHUB_BRANCH = "main"
 
-DNN_FILE = "DNN_forecasts_10AM.csv"     # DNN point forecast + Imputed flag
+# The forecast model. Read from the environment (Render settings or .env) so a
+# new model can be plugged in without changing the code, as long as it publishes
+# the same format: one row per 15-min slot with DateTime, the forecast value and
+# an Imputed flag. The defaults are the current model.
+DNN_FILE = os.getenv("FORECAST_FILE", "DNN_forecasts_10AM.csv")     # file in the repo's Forecast/ folder
+FORECAST_COLUMN = os.getenv("FORECAST_COLUMN", "DNN_expanding")   # column holding the forecast value
+MODEL_NAME = os.getenv("MODEL_NAME", "dnn_v4")                    # label saved with every submission
 BE_DATA_FILE = "Data_BE_UTC.csv"        # Realized price, load, weather, renewables
 
 STEPS_PER_DAY = 96  # 15-minute resolution: 24h * 4
 
 EXPERT_ROLES = ["expert"]  # roles selectable at self-registration (no public admin signup)
+
+# --------------------------------------------------------------------------
+# DAY-AHEAD SUBMISSION WINDOW
+# Mirrors the real day-ahead market: the forecast for day d+1 can only be
+# adjusted until 12:00 (Brussels time) on day d. All checks run here on the
+# server, so the expert's own computer clock doesn't matter.
+# --------------------------------------------------------------------------
+
+BRUSSELS = ZoneInfo("Europe/Brussels")  # handles summer/winter time automatically
+GATE_CLOSURE_HOUR = 12   # submissions close at 12:00 on the day before delivery
+ACTUALS_HOUR = 14        # actual prices for d+1 are pushed around 14:00 on day d
+STUDY_START_DATE = dt.date(2026, 10, 15)  # first delivery day that counts in the study -- set your real start date
+
+# LOCAL TESTING ONLY: set FAKE_NOW="2026-10-09 11:58" in .env to pretend
+# it's a different time. The clock keeps ticking from there. NEVER set this on Render.
+_fake_now = os.getenv("FAKE_NOW")
+_CLOCK_OFFSET = (
+    dt.datetime.fromisoformat(_fake_now).replace(tzinfo=BRUSSELS) - dt.datetime.now(BRUSSELS)
+    if _fake_now else timedelta(0)
+)
+
+
+def now_brussels():
+    return dt.datetime.now(BRUSSELS) + _CLOCK_OFFSET
+
+
+def tomorrow_brussels():
+    return now_brussels().date() + timedelta(days=1)
+
+
+def gate_closure(forecast_date):
+    """12:00 Brussels time on the day before delivery."""
+    return dt.datetime.combine(forecast_date - timedelta(days=1), dt.time(GATE_CLOSURE_HOUR), tzinfo=BRUSSELS)
+
+
+def is_editable(forecast_date):
+    """Only tomorrow's forecast, and only before 12:00 today."""
+    return forecast_date == tomorrow_brussels() and now_brussels() < gate_closure(forecast_date)
+
+
+def minutes_left(forecast_date):
+    return max(0, int((gate_closure(forecast_date) - now_brussels()).total_seconds() // 60))
+
+
+def actuals_published(forecast_date):
+    """Actual prices for tomorrow come out in the afternoon; anything up to today is settled."""
+    now = now_brussels()
+    if forecast_date <= now.date():
+        return True
+    return forecast_date == now.date() + timedelta(days=1) and now.hour >= ACTUALS_HOUR
 
 
 
@@ -238,10 +297,13 @@ def apply_theme():
             border: 1px solid {palette['border']};
             border-radius: 8px;
         }}
+        /* Message boxes (st.info / warning / error): Streamlit draws its own
+           rounded, tinted box inside the stAlert wrapper. Keep the wrapper
+           invisible, otherwise it shows as a square frame around that box. */
         [data-testid="stAlert"] {{
-            background-color: {palette['card_bg']};
+            background-color: transparent;
             color: {palette['text']} !important;
-            border: 1px solid {palette['border']};
+            border: none;
         }}
         [data-testid="stAlert"] * {{
             color: {palette['text']} !important;
@@ -260,7 +322,7 @@ def apply_theme():
             background-color: {palette['bg_secondary']} !important;
         }}
         /* The date picker's month/year header lives in a separate baseweb
-        wrapper from the day grid itself — cover both, or the header text
+        wrapper from the day grid itself, so cover both, or the header text
         stays stuck on its default color regardless of mode. Background is
         applied to every descendant, not just the outer container: unlike
         color, background-color doesn't cascade down through nested elements
@@ -278,7 +340,7 @@ def apply_theme():
         }}
         /* Icon glyphs (password show/hide, calendar nav arrows, expander
         chevrons, sidebar icons) are SVGs with their own fixed color that
-        doesn't follow the page text color automatically — scoped to
+        doesn't follow the page text color automatically; scoped to
         Streamlit's own UI chrome only, never the Plotly charts, which
         manage their own colors via the template. */
         button svg, [role="button"] svg,
@@ -395,7 +457,7 @@ def fetch_csv_from_github(owner, repo, branch, path, fname, token, usecols=None)
     return pd.read_csv(io.StringIO(resp.text), usecols=usecols)
 
 
-@st.cache_data(ttl=1800)  # 30 min -- catches both the 10AM and 14h daily refreshes without hammering GitHub
+@st.cache_data(ttl=300)  # 5 min, so a forecast pushed at 10:00 shows up by ~10:05
 def get_dnn_df():
     """DNN point forecast: one row per 15-min slot, with DateTime,
     DNN_expanding (the forecast value), and Imputed (True = that day's model
@@ -407,8 +469,7 @@ def get_dnn_df():
     return df.sort_values("DateTime").reset_index(drop=True)
 
 
-
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=300) 
 def get_be_df():
     """Realized Belgian market data: settled day-ahead price plus load,
     solar, wind, and weather -- everything needed for the context metrics,
@@ -425,6 +486,51 @@ def get_be_df():
     df["date_only"] = df["Date"].dt.date
     return df.sort_values("Date").reset_index(drop=True)
 
+def force_refresh_data():
+    """Throws away the saved copies so the next read downloads fresh files
+    from GitHub. Limited to once a minute per user so nobody hammers GitHub."""
+    last = st.session_state.get("last_forced_refresh", 0)
+    if time.time() - last > 60:
+        get_dnn_df.clear()
+        get_be_df.clear()
+        st.session_state["last_forced_refresh"] = time.time()
+
+
+@st.cache_data(ttl=300)
+def get_forecast_commit_time():
+    """When the forecast file was last pushed to GitHub (UTC string), or None."""
+    try:
+        resp = requests.get(
+            f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/commits",
+            params={"path": f"Forecast/{DNN_FILE}", "sha": GITHUB_BRANCH, "per_page": 1},
+            headers={"Authorization": f"Bearer {GITHUB_TOKEN}"} if GITHUB_TOKEN else {},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        commits = resp.json()
+        return commits[0]["commit"]["committer"]["date"] if commits else None
+    except Exception:
+        return None  # never break the page over this
+
+
+def record_publish_time_if_new():
+    """Once tomorrow's forecast exists, store when it was pushed (first value wins)."""
+    tomorrow = tomorrow_brussels()
+    flag = f"publish_recorded_{tomorrow}"
+    if st.session_state.get(flag):
+        return
+    if tomorrow in get_available_dates(get_dnn_df()):
+        published_at = get_forecast_commit_time()
+        if published_at:
+            record_forecast_published(tomorrow, published_at)
+            st.session_state[flag] = True
+
+def has_actual_prices(forecast_date):
+    """True once this day's real prices are published AND present in the data file."""
+    if not actuals_published(forecast_date):
+        return False
+    be_df = get_be_df()
+    return be_df.loc[be_df["date_only"] == forecast_date, "Price"].notna().any()
 
 init_db()  # creates users/feedback tables in SQLite if they don't exist yet
 
@@ -447,7 +553,7 @@ def dnn_forecast(forecast_date, dnn_df):
     day_rows = dnn_df[dnn_df["date_only"] == forecast_date].sort_values("DateTime")
     if len(day_rows) != STEPS_PER_DAY:
         return None, None
-    return day_rows["DNN_expanding"].values, day_rows["DateTime"].values
+    return day_rows[FORECAST_COLUMN].values, day_rows["DateTime"].values
 
 
 def dnn_imputed_flags(forecast_date, dnn_df):
@@ -460,6 +566,17 @@ def dnn_imputed_flags(forecast_date, dnn_df):
     return day_rows["Imputed"].values
 
 
+def model_for_day(forecast_date, dnn_df):
+    """Which model produced this day's forecast. Uses a "model" column in the
+    forecast file if the publisher adds one (useful if one file ever holds
+    forecasts from more than one model), otherwise the MODEL_NAME setting."""
+    if "model" in dnn_df.columns:
+        day = dnn_df.loc[dnn_df["date_only"] == forecast_date, "model"].dropna()
+        if not day.empty:
+            return str(day.iloc[0])
+    return MODEL_NAME
+
+
 def _forecast_vs_actual(dnn_df, be_df):
     """Settled (forecast, actual) pairs, shared prep for both conformal
     methods below. Excludes the unsettled current day.
@@ -470,7 +587,7 @@ def _forecast_vs_actual(dnn_df, be_df):
     silently returning a NaN margin overall."""
     last_evaluable = get_last_evaluable_ts()
     merged = (
-        dnn_df.set_index("DateTime")["DNN_expanding"].rename("forecast")
+        dnn_df.set_index("DateTime")[FORECAST_COLUMN].rename("forecast")
         .to_frame()
         .join(be_df.set_index("Date")["Price"].rename("actual"), how="inner")
         .sort_index()
@@ -561,7 +678,7 @@ def get_dnn_history_window(dnn_df, be_df, days=14):
         unsettled day still shows its forecast line (with a gap where the
         actual isn't in yet) instead of disappearing entirely.
     """
-    forecast = dnn_df.set_index("DateTime")["DNN_expanding"].rename("forecast").sort_index()
+    forecast = dnn_df.set_index("DateTime")[FORECAST_COLUMN].rename("forecast").sort_index()
     if forecast.empty:
         return pd.DataFrame(columns=["DateTime", "forecast", "actual"])
 
@@ -633,10 +750,12 @@ def make_renewables_chart(timestamps, solar=None, wind=None, net_load=None):
     return themed(figure)
 
 
-def make_comparison_chart(timestamps, forecast, adjusted, band_lower=None, band_upper=None, flagged=None):
-    """Forecast vs. adjusted with the uncertainty band and flagged anomaly
-    markers -- the read-only counterpart to draggable_curve, for
-    admin-viewed or already-submitted work where dragging doesn't apply."""
+def make_comparison_chart(timestamps, forecast, adjusted=None, band_lower=None, band_upper=None,
+                          flagged=None, actual=None):
+    """Read-only chart: forecast, optional expert adjustment, uncertainty band,
+    flagged markers and, once published, the actual price. `adjusted` is None
+    for days the expert didn't submit, so no misleading copy of the forecast
+    is drawn."""
     figure = go.Figure()
 
     if band_lower is not None and band_upper is not None:
@@ -646,19 +765,24 @@ def make_comparison_chart(timestamps, forecast, adjusted, band_lower=None, band_
             fill="tonexty", fillcolor="rgba(100,100,255,0.35)", name="Likely price range (80%)",
         ))
 
-    figure.add_trace(go.Scatter(x=timestamps, y=forecast, mode="lines", name="DNN Forecast",
-                                 line=dict(width=2, dash="dash")))
-    figure.add_trace(go.Scatter(x=timestamps, y=adjusted, mode="lines+markers", name="Expert Adjusted",
-                                 marker=dict(size=4)))
+    # Colours match render_chart_legend() and the drag chart: grey dashed forecast, indigo adjustment.
+    figure.add_trace(go.Scatter(x=timestamps, y=forecast, mode="lines", name="Model forecast",
+                                 line=dict(width=2, dash="dash", color=get_palette()["text_muted"])))
+    if adjusted is not None:
+        figure.add_trace(go.Scatter(x=timestamps, y=adjusted, mode="lines+markers", name="Expert Adjusted",
+                                     line=dict(color="#6366f1"), marker=dict(size=4, color="#6366f1")))
+    if actual is not None:
+        figure.add_trace(go.Scatter(x=timestamps, y=actual, mode="lines", name="Actual price",
+                                     line=dict(width=2, color="#e5e7eb")))
 
-    # Anomaly markers: slots outside this day's own 5th/95th percentile
-    # (computed by the caller, see the flagging comment in page_review_and_adjust).
+    # Anomaly markers: slots outside this day's own 5th/95th percentile.
+    # Drawn on the adjusted curve if there is one, otherwise on the forecast.
     if flagged is not None and np.any(flagged):
         flagged = np.asarray(flagged)
         ts_arr = np.asarray(timestamps)
-        adj_arr = np.asarray(adjusted)
+        marker_y = np.asarray(adjusted if adjusted is not None else forecast)
         figure.add_trace(go.Scatter(
-            x=ts_arr[flagged], y=adj_arr[flagged], mode="markers", name="Flagged (5th/95th pct)",
+            x=ts_arr[flagged], y=marker_y[flagged], mode="markers", name="Flagged (5th/95th pct)",
             marker=dict(size=6, symbol="diamond", color="orange", line=dict(color="white", width=1)),
         ))
 
@@ -669,11 +793,12 @@ def make_comparison_chart(timestamps, forecast, adjusted, band_lower=None, band_
         yaxis_title="EUR / MWh",
         xaxis=dict(tickformat="%H:%M", dtick=3600000, range=[ts_min, ts_max]),
         showlegend=False,  # replaced by render_chart_legend() below -- see its docstring
+        margin=dict(l=60, r=20, t=20, b=50),  # no empty title area above the plot
     )
     return themed(figure)
 
 
-def render_chart_legend(show_forecast=True, show_band=True, show_flagged=True):
+def render_chart_legend(show_adjusted=True, show_forecast=True, show_band=True, show_flagged=True, show_actual=False):
     """Custom HTML legend matching draggable_curve's own hand-built one --
     same colors/shapes/layout, so editing (drag widget) and read-only
     (static Plotly chart) look consistent. Plotly's native legend is off in
@@ -681,13 +806,19 @@ def render_chart_legend(show_forecast=True, show_band=True, show_flagged=True):
     DraggableCurve.tsx's version, not shared code."""
     palette = get_palette()
 
-    items = ['<span style="display:flex;align-items:center;gap:5px;">'
-             '<span style="width:14px;height:3px;background:#6366f1;display:inline-block;border-radius:1px;"></span>'
-             'Adjusted</span>']
+    items = []
+    if show_adjusted:
+        items.append('<span style="display:flex;align-items:center;gap:5px;">'
+                      '<span style="width:14px;height:3px;background:#6366f1;display:inline-block;border-radius:1px;"></span>'
+                      'Adjusted</span>')
     if show_forecast:
         items.append('<span style="display:flex;align-items:center;gap:5px;">'
                       f'<span style="width:14px;height:0;border-top:2px dashed {palette["text_muted"]};display:inline-block;opacity:0.6;"></span>'
-                      'DNN Forecast</span>')
+                      'Model forecast</span>')
+    if show_actual:
+        items.append('<span style="display:flex;align-items:center;gap:5px;">'
+                      '<span style="width:14px;height:3px;background:#e5e7eb;display:inline-block;border-radius:1px;"></span>'
+                      'Actual price</span>')
     if show_band:
         items.append('<span style="display:flex;align-items:center;gap:5px;">'
                       '<span style="width:14px;height:10px;background:rgba(100,100,255,0.35);display:inline-block;border-radius:2px;"></span>'
@@ -714,10 +845,10 @@ def make_history_chart(history_df):
                                  mode="lines", name="Actual",
                                  line=dict(width=2.4, color=palette["text"])))
     figure.add_trace(go.Scatter(x=history_df["DateTime"], y=history_df["forecast"],
-                                 mode="lines", name="DNN forecast",
+                                 mode="lines", name="Model forecast",
                                  line=dict(width=2.2, color="#C97B63")))  # Margarida's DNN color
     figure.update_layout(
-        title=dict(text="DNN vs Actual", x=0.01, xanchor="left", font=dict(size=20)),
+        title=dict(text="Model forecast vs actual", x=0.01, xanchor="left", font=dict(size=20, color=get_palette()["text"])),
         xaxis_title="DateTime", yaxis_title="EUR / MWh",
         hovermode="x unified",
         xaxis=dict(rangeslider=dict(visible=True)),
@@ -752,7 +883,7 @@ def make_error_scatter_chart(history_df):
         figure.update_yaxes(range=[lo, hi])
 
     figure.add_trace(go.Scatter(
-        x=settled["actual"], y=settled["forecast"], mode="markers", name="DNN (15-min slots)",
+        x=settled["actual"], y=settled["forecast"], mode="markers", name="Forecast (15-min slots)",
         marker=dict(size=5, color="#C97B63", opacity=0.65),  # Margarida's DNN color
         customdata=np.column_stack([settled["DateTime"].dt.strftime("%a %d %b %H:%M"), error]),
         hovertemplate=(
@@ -763,8 +894,8 @@ def make_error_scatter_chart(history_df):
         ),
     ))
     figure.update_layout(
-        title=dict(text="Actual vs DNN forecast", x=0.01, xanchor="left", font=dict(size=20)),
-        xaxis_title="Actual (EUR/MWh)", yaxis_title="DNN forecast (EUR/MWh)",
+        title=dict(text="Actual vs model forecast", x=0.01, xanchor="left", font=dict(size=20, color=get_palette()["text"])),
+        xaxis_title="Actual (EUR/MWh)", yaxis_title="Model forecast (EUR/MWh)",
         legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="right", x=1.0),
         height=520,
     )
@@ -827,7 +958,7 @@ def render_submission_survey(expert_id, forecast_date, survey_key):
     next time rather than marked done."""
     st.divider()
     st.subheader("Quick reflection")
-    st.caption("A few questions for the research behind this tool -- not about the forecast itself.")
+    st.caption("A few questions for the research behind this tool, not about the forecast itself.")
 
     existing_experience = get_user_profile(expert_id)
     ask_experience = existing_experience is None
@@ -876,6 +1007,91 @@ def render_submission_survey(expert_id, forecast_date, survey_key):
         st.session_state[survey_key] = False
         st.rerun()
 
+def _status_pill(label, color):
+    """Small rounded label with a coloured dot in front, e.g. for OPEN."""
+    return (
+        f'<span style="display:inline-flex;align-items:center;gap:6px;padding:2px 10px;'
+        f'border-radius:999px;background:{color}26;color:{color};font-size:0.72rem;'
+        f'font-weight:700;letter-spacing:0.05em;white-space:nowrap;">'
+        f'<span style="width:7px;height:7px;border-radius:50%;background:{color};"></span>{label}</span>'
+    )
+
+
+@st.fragment(run_every="60s")
+def render_status_banner(forecast_date, expert_id):
+    """One status card at the top of the Review page. Re-runs on its own every
+    60s; when something important changes (forecast arrives, 12:00 passes,
+    actual prices arrive) it reloads the whole page so the chart and buttons
+    update too."""
+    palette = get_palette()
+    tomorrow = tomorrow_brussels()
+    available = get_available_dates(get_dnn_df())
+    before_noon = now_brussels() < gate_closure(tomorrow)
+    waiting = tomorrow not in available and before_noon       # forecast not here yet, still time
+    missed = tomorrow not in available and not before_noon    # forecast didn't arrive in time
+    editable = is_editable(forecast_date)
+    submitted = _cached_has_submitted(expert_id, forecast_date) if expert_id else False
+    prices_in = has_actual_prices(forecast_date)
+    prices_pending = not editable and not prices_in
+
+    # Remember the situation from the last run; if it changed, reload the whole page.
+    state = (waiting, editable, prices_in)
+    state_key = f"status_state_{forecast_date}"
+    previous = st.session_state.get(state_key)
+    st.session_state[state_key] = state
+    if previous is not None and previous != state:
+        if previous[0] and not waiting:
+            st.session_state["jump_to_tomorrow"] = True  # forecast just arrived: open it
+        st.rerun()
+
+    # What to say: one pill + headline, and up to two short detail lines.
+    details = []
+    if waiting:
+        pill, color = "WAITING", "#f59e0b"
+        headline = "Tomorrow's forecast isn't available yet"
+        details.append("It usually arrives around 10:00. This page checks automatically.")
+    elif forecast_date == tomorrow and editable and submitted:
+        pill, color = "SUBMITTED", "#22c55e"
+        headline = "Your submission for this day is saved"
+        details.append("Submissions are final.")
+    elif forecast_date == tomorrow and editable:
+        mins = minutes_left(forecast_date)
+        left = "less than a minute" if mins < 1 else f"{mins} min"
+        pill, color = "OPEN", "#22c55e"
+        headline = "Submissions for this day are open until 12:00"
+        details.append(f"{left} left.")
+    elif forecast_date == tomorrow:
+        pill, color = "CLOSED", "#ef4444"
+        headline = "Submissions for this day closed at 12:00"
+    else:
+        pill, color = "VIEW ONLY", palette["text_muted"]
+        headline = "The submission window for this day has closed"
+
+    if missed:
+        details.append("Tomorrow's forecast didn't arrive before 12:00, so there's nothing to submit today.")
+    if prices_pending and not waiting:
+        details.append(f"Actual prices aren't in yet. They usually appear around {ACTUALS_HOUR}:00; this page checks automatically.")
+
+    html = (
+        '<div style="display:flex;flex-direction:column;gap:4px;">'
+        '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">'
+        f'{_status_pill(pill, color)}'
+        f'<span style="font-weight:600;color:{palette["text"]};">{headline}</span></div>'
+        + "".join(f'<div style="color:{palette["text_muted"]};font-size:0.9rem;">{d}</div>' for d in details)
+        + "</div>"
+    )
+
+    # One bordered card; a single "Check now" button only while something is still on its way.
+    with st.container(border=True):
+        if waiting or prices_pending:
+            col_text, col_btn = st.columns([5, 1], vertical_alignment="center")
+            col_text.html(html)
+            if col_btn.button("Check now", key="check_now", width="stretch"):
+                force_refresh_data()
+                st.rerun()
+        else:
+            st.html(html)
+
 
 def page_review_and_adjust():
     """Core page: load a forecast, show context/charts, let an expert
@@ -905,11 +1121,15 @@ def page_review_and_adjust():
 
         available_dates = get_available_dates(dnn_df)
         if not available_dates:
-            st.error("No complete DNN forecast days available yet.")
+            st.error("No complete forecast days available yet.")
             return
+        # Start on the newest day; jump to tomorrow when its forecast arrives (see render_status_banner).
+        if "review_forecast_date" not in st.session_state:
+            st.session_state["review_forecast_date"] = available_dates[-1]
+        if st.session_state.pop("jump_to_tomorrow", False) and tomorrow_brussels() in available_dates:
+            st.session_state["review_forecast_date"] = tomorrow_brussels()
         forecast_date = st.date_input(
             "Forecast date (day d+1)",
-            value=available_dates[-1],
             min_value=available_dates[0],
             max_value=available_dates[-1],
             key="review_forecast_date",  # explicit key so this survives a page switch
@@ -917,14 +1137,17 @@ def page_review_and_adjust():
 
     forecast, timestamps = dnn_forecast(forecast_date, dnn_df)
     if forecast is None:
-        st.error(f"No complete DNN forecast for {forecast_date}.")
+        st.error(f"No complete forecast for {forecast_date}.")
         return
+
+    record_publish_time_if_new()
+    render_status_banner(forecast_date, expert_id)
 
     # Warn if this day's forecast is a stale carry-forward from a failed model run.
     imputed_flags = dnn_imputed_flags(forecast_date, dnn_df)
     if imputed_flags is not None and imputed_flags.any():
         st.warning(
-            f"⚠️ This forecast run failed for {forecast_date}. The previous day's forecast was "
+            f"This forecast run failed for {forecast_date}. The previous day's forecast was "
             "carried forward. Treat this forecast with extra caution."
         )
 
@@ -960,7 +1183,7 @@ def page_review_and_adjust():
         if context_available:
             st.metric(
                 "Avg. Net BE load (MW)", f"{net_load:,.0f}",
-                help="Gross load minus solar and wind generation -- the portion of load "
+                help="Gross load minus solar and wind generation: the portion of load "
                      "that has to be covered by other (price-setting) generation.",
             )
             st.metric("Avg. temp (°C)", f"{avg_temp:.1f}")
@@ -982,7 +1205,7 @@ def page_review_and_adjust():
             "can be dragged up or down accordingly."
         )
         st.write(
-            "In the left side panel, the second page: :red[***Deterministic Forecast Analysis***] shows the DNN forecast against the "
+            "In the left side panel, the second page: :red[***Deterministic Forecast Analysis***] shows the model forecast against the "
             "actual prices across the last 14 days. Further down, there is relevant day "
             "information, as well as two slider buttons for displaying the temperature and "
             "humidity plots."
@@ -995,11 +1218,11 @@ def page_review_and_adjust():
             "load is high, especially in the evening once solar drops off."
         )
         st.write(
-            "**Submitting your results:** once you're happy with your adjustments, scroll to the "
-            "bottom of this page. In the :violet[***Your confidence***] box, set the slider from 1 "
-            "(no confidence) to 5 (highest confidence), then click :violet[***Submit results***]. "
-            "Submissions are final, so double-check your curve first. If you haven't changed "
-            "anything, submitting records that you agree with the model's forecast as-is."
+            "**Submitting your results:** tomorrow's forecast can be adjusted until **12:00** today. "
+            "In the :violet[***Your confidence***] box, set the slider, then click "
+            ":violet[***Submit my adjustments***], or :violet[***Keep forecast as is***] if you agree "
+            "with the model. Submissions are final. Past days are view-only and show the actual "
+            "price once it's published."
         )
 
     # Auto-flag: 5th/95th percentile of THIS day's own forecast, not a
@@ -1029,6 +1252,8 @@ def page_review_and_adjust():
     already_submitted = _cached_has_submitted(expert_id, forecast_date) if expert_id else False
     is_read_only = (current_role == "admin")
 
+    window_open = is_editable(forecast_date)
+
     if key not in st.session_state:
         # Restore a prior unsubmitted session (navigated away before
         # submitting) instead of resetting to the raw forecast. Scoped to
@@ -1050,20 +1275,33 @@ def page_review_and_adjust():
     band_lower = (working["forecast"] - margin).tolist() if margin is not None else None
     band_upper = (working["forecast"] + margin).tolist() if margin is not None else None
 
-    # Draggable while editing, static once there's nothing left to drag --
-    # both show forecast/adjustment/band/flags together.
-    if is_read_only or already_submitted:
+    # Actual prices: only once the window has closed and the prices are published.
+    actual_vals = None
+    if not window_open and actuals_published(forecast_date):
+        price = be_df.set_index("Date")["Price"]
+        price = price[~price.index.duplicated(keep="last")]
+        candidate = price.reindex(pd.to_datetime(working["timestamp_slot"])).values
+        if not np.isnan(candidate).all():
+            actual_vals = candidate
+
+    # Draggable while editing, static once there's nothing left to drag.
+    if is_read_only or already_submitted or not window_open:
+        show_adjusted = already_submitted  # a day without a submission has no adjustment to show
         st.plotly_chart(
             make_comparison_chart(
-                working["timestamp_slot"].values, working["forecast"].values, working["adjusted"].values,
+                working["timestamp_slot"].values, working["forecast"].values,
+                working["adjusted"].values if show_adjusted else None,
                 band_lower=band_lower, band_upper=band_upper, flagged=working["flagged"].values,
+                actual=actual_vals,
             ),
             width="stretch",
         )
         render_chart_legend(
-            show_forecast=True,  # make_comparison_chart always plots forecast, unlike draggable_curve where it's optional
+            show_adjusted=show_adjusted,
+            show_forecast=True,
             show_band=band_lower is not None,
             show_flagged=bool(np.any(working["flagged"].values)),
+            show_actual=actual_vals is not None,
         )
     else:
         dragged = draggable_curve(
@@ -1087,8 +1325,20 @@ def page_review_and_adjust():
     else:
         st.caption(
             f"Likely price range: the real price usually lands within ± {margin:.2f} EUR/MWh "
-            "of the DNN forecast (about 8 times out of 10)."
+            "of the model forecast (about 8 times out of 10)."
         )
+
+    # Result cards for a settled day: how far off were the model and the expert?
+    if actual_vals is not None:
+        mask = ~np.isnan(actual_vals)
+        model_mae = np.abs(working["forecast"].values[mask] - actual_vals[mask]).mean()
+        r1, r2, r3 = st.columns(3)
+        r1.metric("Model error (MAE)", f"{model_mae:.2f} EUR/MWh")
+        if already_submitted:
+            expert_mae = np.abs(working["adjusted"].values[mask] - actual_vals[mask]).mean()
+            r2.metric("Your error (MAE)", f"{expert_mae:.2f} EUR/MWh")
+            r3.metric("Your improvement", f"{model_mae - expert_mae:+.2f} EUR/MWh",
+                      help="Model error minus your error. Positive means your adjustment beat the model.")
 
 
     # Solar+wind share one chart: their combined dip drives net load and
@@ -1145,39 +1395,46 @@ def page_review_and_adjust():
                 width="stretch",
             )
 
-    # Footer: the reflection survey is one-time-ever (has_completed_survey
-    # checks all submissions, not just today's); confidence is unaffected,
-    # asked every time via the separate "submissions" table.
-    if is_read_only or already_submitted:
+    # Footer: survey right after a fresh submission; otherwise a message
+    # explaining why the day is view-only, or the two submit buttons.
+    if is_read_only or already_submitted or not window_open:
         if is_read_only:
             st.info(f"Viewing {expert_id}'s submission (read-only, admins cannot submit on behalf of experts).")
-        elif st.session_state.get(survey_key, False) and not has_completed_survey(expert_id):
+        elif already_submitted and st.session_state.get(survey_key, False) and not has_completed_survey(expert_id):
             render_submission_survey(expert_id, forecast_date, survey_key)
+        elif already_submitted:
+            log = _cached_load_submissions(expert_id, forecast_date)
+            action = log["action"].iloc[0] if not log.empty else None
+            label = {"adjusted": "adjusted the forecast", "accepted": "kept the forecast as is"}.get(action, "submitted")
+            st.info(f"You {label} for {forecast_date}. Submissions are final.")
         else:
-            st.info(f"You've already submitted results for {forecast_date}. Submissions are final.")
+            st.info(f"You didn't submit before 12:00 for {forecast_date}. This day is view-only.")
     else:
-        # No form needed: dragging already updates session state and
-        # reruns on release, so `working` is current by the time Submit
-        # is clicked.
-        #
-        # Trade-off: the old per-slot "Flag" checkbox is gone -- `flagged`
-        # is now purely automatic, no manual override.
         with st.container(border=True):
             st.subheader("Your confidence")
-            confidence = st.slider("How confident are you in these adjustments? (1-no confidence, 5-highest confidence)", 1, 5, 3)
-            submitted = st.button("Submit results")
+            confidence = st.slider("How confident are you in this forecast? (1-no confidence, 5-highest confidence)", 1, 5, 3)
+            col_adjust, col_keep, _ = st.columns([1, 1, 2])  # buttons side by side, left-aligned
+            submit_adjusted = col_adjust.button("Submit my adjustments", type="primary")
+            keep_as_is = col_keep.button("Keep forecast as is")
 
-        if submitted:
-            if not expert_id:
+        if submit_adjusted or keep_as_is:
+            unchanged = np.allclose(working["adjusted"].values, working["forecast"].values)
+            if not is_editable(forecast_date):
+                # Re-check the clock at the moment of the click: the page may
+                # have been opened before 12:00 but clicked after.
+                st.error("The submission window closed at 12:00. Nothing was saved.")
+            elif not expert_id:
                 st.error("Error: No Expert ID found.")
+            elif submit_adjusted and unchanged:
+                st.warning("You haven't changed the curve. Drag it first, or click **Keep forecast as is**.")
             elif has_submitted(expert_id, forecast_date):
-                # Guards against a double-submit race (e.g. two tabs open on the same date) --
-                # the fast-path check for the normal case. The DuplicateSubmissionError catch
-                # below is the actual, database-enforced backstop for the rare case where two
-                # near-simultaneous submissions both pass this check before either commits.
                 st.error("A submission already exists for this date. Refresh the page.")
             else:
                 rows = working.copy()
+                if keep_as_is:
+                    rows["adjusted"] = rows["forecast"]  # store exactly the model's curve
+                rows["action"] = "accepted" if keep_as_is else "adjusted"
+                rows["model_name"] = model_for_day(forecast_date, dnn_df)
                 rows["expert_id"] = expert_id
                 rows["forecast_date"] = forecast_date
                 rows["timestamp"] = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -1187,15 +1444,11 @@ def page_review_and_adjust():
                 except DuplicateSubmissionError:
                     st.error("A submission already exists for this date. Refresh the page.")
                 else:
-                    # Invalidate the short-TTL caches so this submission is
-                    # immediately visible everywhere (this page's read-only
-                    # branch, admin's Reveal & Evaluate / Scoreboard) instead
-                    # of waiting out the TTL.
                     _cached_has_submitted.clear()
                     _cached_load_submissions.clear()
-                    st.session_state[survey_key] = True  # triggers render_submission_survey() on the next render
-                    render_success_banner(f"Forecast submitted for {forecast_date}! Saved {len(rows)} adjusted values.")
-                    st.rerun()  # forces the page back into the read-only branch above
+                    st.session_state[survey_key] = True
+                    render_success_banner(f"Forecast submitted for {forecast_date}!")
+                    st.rerun()
 
 
 # --------------------------------------------------------------------------
@@ -1225,7 +1478,7 @@ def page_reveal_and_evaluate():
             "then."
         )
         st.write(
-            "Once it's settled, both the original DNN forecast and the "
+            "Once it's settled, both the original model forecast and the "
             "expert's dragged, adjusted version are compared against that "
             "real price using MAE (mean absolute error, in EUR/MWh): the "
             "average, across the day's 96 fifteen-minute slots, of how far "
@@ -1258,7 +1511,7 @@ def page_reveal_and_evaluate():
     submission = (
         log.loc[
             (log["expert_id"] == expert_id) & (log["forecast_date"] == forecast_date),
-            ["timestamp_slot", "forecast", "adjusted", "confidence"],
+            ["timestamp_slot", "forecast", "adjusted", "confidence", "model_name"],
         ]
         .sort_values("timestamp_slot")
     )
@@ -1283,7 +1536,7 @@ def page_reveal_and_evaluate():
     evaluation = evaluation.dropna(subset=["actual"])
 
     if evaluation.empty:
-        st.info(f"Realized prices for {forecast_date} are missing from the data feed -- nothing to evaluate yet.")
+        st.info(f"Realized prices for {forecast_date} are missing from the data feed, so there is nothing to evaluate yet.")
         return
 
     forecast_mae = (evaluation["forecast"] - evaluation["actual"]).abs().mean()
@@ -1291,8 +1544,10 @@ def page_reveal_and_evaluate():
     confidence_rating = submission["confidence"].iloc[0]  # constant across the day's 96 rows
 
     if n_missing_actual > 0:
-        st.caption(f"⚠️ {n_missing_actual} of {STEPS_PER_DAY} slots had a missing realized price and were excluded from these MAE numbers.")
+        st.caption(f"{n_missing_actual} of {STEPS_PER_DAY} slots had a missing realized price and were excluded from these MAE numbers.")
 
+    model_used = submission["model_name"].dropna()
+    st.caption(f"Forecast model: {model_used.iloc[0] if not model_used.empty else 'not recorded (submitted before model tracking)'}")
     forecast_metric, adjusted_metric, confidence_metric = st.columns(3)
     forecast_metric.metric("Forecast MAE", f"{forecast_mae:.2f} EUR/MWh")
     adjusted_metric.metric("Adjusted MAE", f"{adjusted_mae:.2f} EUR/MWh")
@@ -1344,9 +1599,50 @@ def page_expert_scoreboard():
         )
 
     log = _cached_load_submissions()
+    if not log.empty:
+        log = log[log["action"] != "legacy"]  # pre-deadline submissions aren't part of the study
+
+    # Participation: for every closed study day with a forecast, did each
+    # expert adjust, keep as is, or not respond at all?
+    tomorrow = tomorrow_brussels()
+    last_closed = tomorrow if not is_editable(tomorrow) else tomorrow - timedelta(days=1)
+    study_days = [d for d in get_available_dates(get_dnn_df()) if STUDY_START_DATE <= d <= last_closed]
+    # Days whose forecast was published after 12:00: nobody could submit those.
+    # They still count as "no response", but are flagged in their own column.
+    availability = load_forecast_availability()
+    late_days = {
+        dt.date.fromisoformat(row["forecast_date"])
+        for _, row in availability.iterrows()
+        if pd.Timestamp(row["published_at"]).tz_convert(BRUSSELS) >= gate_closure(dt.date.fromisoformat(row["forecast_date"]))
+    }
+    too_late = [d for d in study_days if d in late_days]
+    experts = [u for u, d in _cached_load_users().items() if d["role"] == "expert"]
+    participation = []
+    for e in experts:
+        actions = (log[log["expert_id"] == e].groupby("forecast_date")["action"].first()
+                   if not log.empty else pd.Series(dtype=str))
+        actions = actions[actions.index.isin(study_days)]
+        participation.append({
+            "expert_id": e,
+            "adjusted": int((actions == "adjusted").sum()),
+            "kept_as_is": int((actions == "accepted").sum()),
+            "no_response": len(study_days) - len(actions),
+            "of_which_forecast_late": len([d for d in too_late if d not in actions.index]),
+        })
+    st.subheader("Participation")
+    st.caption(
+        f"{len(study_days)} closed study days since {STUDY_START_DATE}. "
+        + (f"On {len(too_late)} of them the forecast arrived after 12:00 "
+           f"({', '.join(str(d) for d in too_late)}); they count as no response "
+           "and are flagged in the last column." if too_late
+           else "The forecast arrived on time on all of them.")
+    )
+    st.dataframe(pd.DataFrame(participation), hide_index=True)
+
     if log.empty:
-        st.warning("No submissions yet.")
+        st.warning("No study submissions yet.")
         return
+    st.subheader("Accuracy")
 
     be_df = get_be_df()
     last_evaluable = get_last_evaluable_ts()
@@ -1381,6 +1677,7 @@ def page_expert_scoreboard():
             "adjusted_mae": adjusted_mae,
             "improvement": forecast_mae - adjusted_mae,  # positive = the expert helped
             "confidence": group["confidence"].iloc[0],
+            "model": group["model_name"].dropna().iloc[0] if group["model_name"].notna().any() else "not recorded",
         })
 
     if not results:
@@ -1390,7 +1687,8 @@ def page_expert_scoreboard():
     results_df = pd.DataFrame(results)
 
     scoreboard = (
-        results_df.groupby("expert_id")
+        # One row per expert, or per expert and model once more than one model has been used.
+        results_df.groupby(["expert_id", "model"] if results_df["model"].nunique() > 1 else ["expert_id"])
         .agg(
             avg_improvement=("improvement", "mean"),
             days_reviewed=("forecast_date", "nunique"),
@@ -1420,7 +1718,7 @@ ONBOARDING_STEPS = [
         "title": "What this app is for",
         "body": (
             "You'll review a day-ahead electricity price forecast produced by a "
-            "neural network, and adjust it if you disagree with part of it. This is "
+            "forecasting model, and adjust it if you disagree with part of it. This is "
             "part of a research study measuring whether human review actually "
             "improves electricity price forecasts."
         ),
@@ -1454,10 +1752,12 @@ ONBOARDING_STEPS = [
     {
         "title": "Submitting",
         "body": (
-            "Once you're happy with your adjustment, rate how confident you are and "
-            "click Submit. Submissions are final. There's no editing afterward. "
-            "Right after submitting, you'll be asked a few short reflection "
-            "questions. Please answer honestly."
+            "Each morning around 10:00, the forecast for tomorrow appears. You can adjust it "
+            "until 12:00, just like the real day-ahead market. Rate your confidence, then click "
+            "Submit my adjustments, or Keep forecast as is if you agree with the model. "
+            "Submissions are final. After 12:00 the day becomes view-only, and from about "
+            "14:00 you can see the actual prices next to the forecast. Right after your first "
+            "submission, you'll be asked a few short reflection questions."
         ),
     },
 ]
@@ -1522,7 +1822,7 @@ def render_success_banner(message):
     st.markdown(
         f'<div style="background-color:{bg_color};border:1px solid #22c55e;'
         f'border-radius:8px;padding:0.75rem 1rem;color:{text_color};font-weight:500;">'
-        f'✅ {message}</div>',
+        f'{message}</div>',
         unsafe_allow_html=True,
     )
 
@@ -1584,19 +1884,13 @@ def page_dnn_history():
     her MAE tables). The
     plot design itself is adapted from her public Hugging Face Space; see
     the explanatory text below for the link and what the chart means."""
-    st.title("Deterministic Forecast Analysis, DNN")
-    st.caption("DNN forecast vs. actual settled price, last 14 days.")
+    st.title("Deterministic Forecast Analysis")
+    st.caption("Model forecast vs. actual settled price, last 14 days.")
 
     st.markdown(
-        "This chart's design is taken directly from "
-        "[Margarida's DAM price forecast Space on Hugging Face]"
-        "(https://huggingface.co/spaces/EDS-lab/DAM-price-forecast), "
-        "the source of the underlying DNN model shown here. "
-        "The model is a deep neural network trained to forecast the "
-        "Belgian day-ahead electricity price. It is retrained and run "
-        "on a daily schedule because day-ahead prices have to be "
-        "forecast before each day's auction closes, so a new forecast "
-        "is published every day for the next delivery day. "
+        "A new forecast of the Belgian day-ahead electricity price is "
+        "published every day for the next delivery day, before that "
+        "day's auction closes. "
         "The chart below compares that forecast against the price that "
         "actually settled, once it's known, over the last 14 days. It "
         "is a rolling accuracy check on the model itself, independent "
@@ -1611,7 +1905,7 @@ def page_dnn_history():
     history_df = get_dnn_history_window(dnn_df, be_df, days=14)
 
     if history_df.empty:
-        st.info("No DNN forecast data available yet.")
+        st.info("No forecast data available yet.")
         return
 
     st.plotly_chart(make_history_chart(history_df), width="stretch")
@@ -1619,7 +1913,7 @@ def page_dnn_history():
     st.markdown(
         "The scatter below shows the same days' errors slot by slot: each "
         "point is one settled 15-minute slot, with the actual price on the "
-        "x-axis and the DNN forecast on the y-axis. Points on the dashed "
+        "x-axis and the model forecast on the y-axis. Points on the dashed "
         "diagonal were forecast exactly; the further a point sits from it, "
         "the larger that slot's error. Points above the line are slots the "
         "model over-forecast, points below are slots it under-forecast. "
