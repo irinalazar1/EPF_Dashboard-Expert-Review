@@ -1,0 +1,10 @@
+# App-wide theme, matching get_palette() in app.py. Setting it here (not only
+# via CSS) makes every expert get the same dark look, whatever their own
+# browser/OS light-or-dark setting, and gives sliders, toggles and the drag
+# chart the same indigo accent as the buttons instead of Streamlit's red.
+[theme]
+base = "dark"
+primaryColor = "#6366f1"
+backgroundColor = "#0e1117"
+secondaryBackgroundColor = "#161b22"
+textColor = "#e6edf3"

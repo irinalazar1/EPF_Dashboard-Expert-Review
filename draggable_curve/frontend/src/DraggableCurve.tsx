@@ -273,8 +273,8 @@ const DraggableCurve: React.FC<ComponentProps> = (props) => {
     const original = forecast && forecast.length === n ? forecast[activeIndex] : undefined;
     const showOriginal = original !== undefined && Math.abs(original - v) > 0.05;
     const text = showOriginal
-      ? `${labels[activeIndex]} — ${v.toFixed(1)} (was ${original.toFixed(1)})`
-      : `${labels[activeIndex]} — ${v.toFixed(1)}`;
+      ? `${labels[activeIndex]}: ${v.toFixed(1)} (was ${original.toFixed(1)})`
+      : `${labels[activeIndex]}: ${v.toFixed(1)}`;
 
     return { boxX, boxY, boxWidth, boxHeight, text };
   }, [activeIndex, values, xForIndex, yForValue, width, forecast, n, labels]);
@@ -389,7 +389,7 @@ const DraggableCurve: React.FC<ComponentProps> = (props) => {
         )}
       </svg>
       <div style={{ fontSize: 12, color: "var(--text-color, #888)", marginTop: 4 }}>
-        Drag any point to adjust it — nearby points within {radius} slots shift too. Hover a point to see its exact time and value.
+        Drag any point to adjust it. Nearby points within {radius} slots shift too. Hover a point to see its exact time and value.
       </div>
       {/* Real legend with color swatches, matching what Plotly's native
         legend showed before this chart became the draggable_curve widget --
@@ -402,7 +402,7 @@ const DraggableCurve: React.FC<ComponentProps> = (props) => {
         {forecastPath && (
           <span style={{ display: "flex", alignItems: "center", gap: 5 }}>
             <span style={{ width: 14, height: 0, borderTop: "2px dashed var(--text-color, #888)", display: "inline-block", opacity: 0.6 }} />
-            DNN Forecast
+            Model forecast
           </span>
         )}
         {bandPath && (

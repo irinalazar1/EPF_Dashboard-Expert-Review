@@ -153,6 +153,27 @@ def init_db():
                 FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE
             )
         """))
+        # How the expert responded: 'adjusted' (changed the curve),
+        # 'accepted' (kept the forecast as is), or 'legacy' (submitted
+        # before the day-ahead deadline existed -- excluded from the study).
+        conn.execute(text("""
+            ALTER TABLE submissions
+            ADD COLUMN IF NOT EXISTS action TEXT NOT NULL DEFAULT 'legacy'
+        """))
+        # Which forecast model produced the forecast the expert saw, so results
+        # can be split per model if the model is ever replaced. Empty for
+        # submissions made before this column existed.
+        conn.execute(text("""
+            ALTER TABLE submissions
+            ADD COLUMN IF NOT EXISTS model_name TEXT
+        """))
+        # When each day's forecast was published, to spot days with a short window.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS forecast_availability (
+                forecast_date TEXT PRIMARY KEY,
+                published_at TEXT NOT NULL
+            )
+        """))
     # engine.begin() commits automatically here, on a clean exit of the block.
 
 
@@ -183,8 +204,8 @@ def save_submission(rows_df):
                 conn.execute(
                     text("""
                         INSERT INTO submissions
-                            (expert_id, forecast_date, timestamp_slot, forecast, adjusted, flagged, confidence, timestamp)
-                        VALUES (:expert_id, :forecast_date, :timestamp_slot, :forecast, :adjusted, :flagged, :confidence, :timestamp)
+                            (expert_id, forecast_date, timestamp_slot, forecast, adjusted, flagged, confidence, timestamp, action, model_name)
+                        VALUES (:expert_id, :forecast_date, :timestamp_slot, :forecast, :adjusted, :flagged, :confidence, :timestamp, :action, :model_name)
                     """),
                     {
                         "expert_id": row["expert_id"],
@@ -195,6 +216,8 @@ def save_submission(rows_df):
                         "flagged": int(bool(row["flagged"])),
                         "confidence": int(row["confidence"]),
                         "timestamp": row["timestamp"],
+                        "action": row["action"],
+                        "model_name": row["model_name"] if "model_name" in row else None,
                     },
                 )
         # engine.begin() rolls back automatically if an exception propagates
@@ -334,3 +357,21 @@ def save_onboarding_status(username, consented, completed_tutorial, timestamp):
             """),
             {"username": username, "consented": int(consented), "completed_tutorial": int(completed_tutorial), "timestamp": timestamp},
         )
+
+
+def record_forecast_published(forecast_date, published_at):
+    """Stores when a day's forecast was published. Only the first value
+    is kept (DO NOTHING), so later calls can't overwrite it."""
+    with _get_engine().begin() as conn:
+        conn.execute(
+            text("""
+                INSERT INTO forecast_availability (forecast_date, published_at)
+                VALUES (:forecast_date, :published_at)
+                ON CONFLICT (forecast_date) DO NOTHING
+            """),
+            {"forecast_date": str(forecast_date), "published_at": published_at},
+        )
+
+
+def load_forecast_availability():
+    return pd.read_sql_query(text("SELECT * FROM forecast_availability"), _get_engine())

@@ -28,7 +28,7 @@ Accuracy is measured with **MAE (mean absolute error, in EUR/MWh)** only, comput
 - **Adjusted MAE**: the error of the expert's adjusted curve.
 - **Improvement** = Forecast MAE − Adjusted MAE. Positive means the expert made the forecast more accurate.
 
-The Expert Scoreboard aggregates this per expert across all settled days: average improvement, number of days reviewed, win rate (share of days where the adjustment beat the model) and average self-reported confidence (1–5). Days are only scored once their price has settled.
+The Expert Scoreboard aggregates this per expert across all settled days: average improvement, number of days reviewed, win rate (share of days where the adjustment beat the model) and average self-reported confidence (1 to 5). Days are only scored once their price has settled.
 
 ## Future work
 
@@ -83,3 +83,30 @@ Hosted on Render as a Docker web service, connected to this repo for auto-deploy
 | Reveal & Evaluate (admin) | Accuracy for one expert's submission once the price settles. |
 | Expert Scoreboard (admin) | Aggregated accuracy improvement per expert. |
 | Survey Results (admin) | Reflection-survey data + experience profiles; CSV export. |
+
+## Replacing the forecast model
+
+The dashboard does not depend on which model produces the forecast. Any model works as long as it publishes the same format to the forecast repo: one row per 15-minute slot with `DateTime`, the forecast value and an `Imputed` flag. Experts only ever see "Model forecast".
+
+Three optional settings (environment variables on Render, or in `.env` locally) describe the model. Leaving them out keeps the current model:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `FORECAST_FILE` | `DNN_forecasts_10AM.csv` | File in the repo's `Forecast/` folder |
+| `FORECAST_COLUMN` | `DNN_expanding` | Column holding the forecast value |
+| `MODEL_NAME` | `dnn_v4` | Label stored with every submission |
+
+Every submission stores the model that produced the forecast the expert saw (`submissions.model_name`). If the forecast file itself has a `model` column, that value is used instead of `MODEL_NAME`. Once more than one model appears in the data, the Expert Scoreboard splits its accuracy table per model, and Reveal & Evaluate shows which model each submission was made against. Switch models after 12:00, so no submission window mixes two models.
+
+## Daily schedule (day-ahead window)
+
+The study mirrors the real day-ahead market. All times are Brussels time.
+
+| Time | What happens |
+|---|---|
+| ~10:00 on day d | The model's forecast for day d+1 appears on the dashboard. |
+| until 12:00 on day d | Experts can adjust it. Each day ends with one of three outcomes per expert: **adjusted**, **kept as is**, or **no response**. |
+| 12:00 | Submissions close; the day becomes view-only. The deadline is enforced on the server. |
+| ~14:00 | Actual prices for day d+1 appear next to the forecast. |
+
+Past days can't be revised, so scores can't be improved with hindsight. Submissions made before this rule existed are marked `legacy` and excluded from the study. The time each forecast was published is stored in `forecast_availability`, so days with a shortened window can be identified.
