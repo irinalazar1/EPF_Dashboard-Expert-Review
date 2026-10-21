@@ -174,6 +174,18 @@ def init_db():
                 published_at TEXT NOT NULL
             )
         """))
+        # Tracks the last "results" email sent to each expert (see
+        # maybe_send_results_email() in app.py), so the same milestone isn't
+        # re-emailed on every login -- only once per new evaluated day past
+        # the threshold.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS email_notifications (
+                username TEXT PRIMARY KEY,
+                last_emailed_days_reviewed INTEGER NOT NULL DEFAULT 0,
+                last_emailed_at TEXT,
+                FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE
+            )
+        """))
     # engine.begin() commits automatically here, on a clean exit of the block.
 
 
@@ -375,3 +387,29 @@ def record_forecast_published(forecast_date, published_at):
 
 def load_forecast_availability():
     return pd.read_sql_query(text("SELECT * FROM forecast_availability"), _get_engine())
+
+
+def get_last_emailed_days_reviewed(username):
+    """Returns the days_reviewed count as of the last results email sent to
+    this user (see maybe_send_results_email() in app.py), or 0 if they've
+    never been emailed."""
+    with _get_engine().connect() as conn:
+        row = conn.execute(
+            text("SELECT last_emailed_days_reviewed FROM email_notifications WHERE username = :username"),
+            {"username": username},
+        ).fetchone()
+    return row[0] if row else 0
+
+
+def mark_results_emailed(username, days_reviewed, timestamp):
+    with _get_engine().begin() as conn:
+        conn.execute(
+            text("""
+                INSERT INTO email_notifications (username, last_emailed_days_reviewed, last_emailed_at)
+                VALUES (:username, :days_reviewed, :timestamp)
+                ON CONFLICT (username) DO UPDATE SET
+                    last_emailed_days_reviewed = EXCLUDED.last_emailed_days_reviewed,
+                    last_emailed_at = EXCLUDED.last_emailed_at
+            """),
+            {"username": username, "days_reviewed": int(days_reviewed), "timestamp": timestamp},
+        )

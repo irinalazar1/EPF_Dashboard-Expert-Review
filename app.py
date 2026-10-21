@@ -32,7 +32,7 @@ from the DNN's own settled residuals via Adaptive Conformal Inference
 PAGES
 -----
 1. Review & Adjust -- the core workflow above.
-2. Deterministic Forecast Analysis -- DNN vs. actual, last 14 days
+2. Historic Forecast Analysis -- DNN vs. actual, last 14 days
    (time series + actual-vs-forecast error scatter).
 3. Reveal & Evaluate (admin) -- MAE for one submission once settled.
 4. Expert Scoreboard (admin) -- aggregated MAE improvement per expert.
@@ -56,6 +56,9 @@ from zoneinfo import ZoneInfo
 from collections import deque
 from datetime import timedelta
 
+import smtplib
+from email.mime.text import MIMEText
+
 import bcrypt
 import holidays
 import numpy as np
@@ -71,6 +74,7 @@ from db import (
     save_submission_survey, load_submission_survey, has_completed_survey,
     get_onboarding_status, save_onboarding_status,
     record_forecast_published, load_forecast_availability,
+    get_last_emailed_days_reviewed, mark_results_emailed,
 )
 from draggable_curve import draggable_curve
 
@@ -147,6 +151,22 @@ DNN_FILE = os.getenv("FORECAST_FILE", "DNN_forecasts_10AM.csv")     # file in th
 FORECAST_COLUMN = os.getenv("FORECAST_COLUMN", "DNN_expanding")   # column holding the forecast value
 MODEL_NAME = os.getenv("MODEL_NAME", "dnn_v4")                    # label saved with every submission
 BE_DATA_FILE = "Data_BE_UTC.csv"        # Realized price, load, weather, renewables
+
+# Where the covariate forecasts (load, solar, wind, temperature, humidity)
+# come from, shown under their charts and in the sidebar. Leave empty to hide.
+# TODO: wording from Margarida, e.g. "Source: ... , published at ... on day d."
+COVARIATE_SOURCE_NOTE = ""
+
+# Results-email notifications (see maybe_send_results_email()): sent via
+# Gmail SMTP using an App Password, not the account password. Both must be
+# set for sending to actually happen; if either is missing,
+# maybe_send_results_email() no-ops rather than raising, so a missing config
+# never breaks the app for anyone. Render blocks outgoing SMTP on its free
+# tier only, so this needs the paid plan set in render.yaml.
+GMAIL_SENDER_ADDRESS = os.getenv("GMAIL_SENDER_ADDRESS")
+GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
+RESULTS_EMAIL_THRESHOLD_DAYS = 10  # send once an expert has *more than* this many evaluated days
+APP_URL = "https://epf-dashboard-expert-review.onrender.com/"  # linked from the results email
 
 STEPS_PER_DAY = 96  # 15-minute resolution: 24h * 4
 
@@ -711,6 +731,33 @@ def make_simple_chart(timestamps, values, y_title):
     return themed(figure)
 
 
+def make_adjustment_chart(timestamps, diff):
+    """The expert's change per 15-min slot (adjusted minus forecast), shown
+    in the submit confirmation pop-up. Positive means the expert raised the
+    price, negative means they lowered it; no change is a flat line at zero.
+    The y-axis is symmetric around zero so raises and cuts look equally big,
+    and it never collapses to nothing when every value is zero."""
+    ts_min = pd.Timestamp(np.asarray(timestamps).min())
+    ts_max = pd.Timestamp(np.asarray(timestamps).max())
+    span = max(float(np.abs(diff).max()), 1.0) * 1.15
+
+    figure = go.Figure()
+    figure.add_hline(y=0, line=dict(color=get_palette()["text_muted"], width=1, dash="dash"))
+    figure.add_trace(go.Scatter(
+        x=timestamps, y=diff, mode="lines", name="Your adjustment",
+        line=dict(color="#6366f1", width=2), fill="tozeroy", fillcolor="rgba(99,102,241,0.15)",
+        hovertemplate="%{x|%H:%M}: %{y:+.2f} EUR/MWh<extra></extra>",
+    ))
+    figure.update_layout(
+        xaxis_title="Time of day",
+        yaxis_title="Adjusted minus forecast (EUR/MWh)",
+        showlegend=False,
+        height=320,
+        xaxis=dict(tickformat="%H:%M", dtick=3 * 3600000, range=[ts_min, ts_max]),
+        yaxis=dict(range=[-span, span]),
+    )
+    return themed(figure)
+
 def make_renewables_chart(timestamps, solar=None, wind=None, net_load=None):
     """Standalone solar + wind (+ optional net load) chart -- all in MW, so
     they share one axis (unlike the main chart's secondary axis, this one
@@ -721,19 +768,19 @@ def make_renewables_chart(timestamps, solar=None, wind=None, net_load=None):
     figure = go.Figure()
     if solar is not None:
         figure.add_trace(go.Scatter(
-            x=timestamps, y=solar, mode="lines", name="Solar (MW)",
+            x=timestamps, y=solar, mode="lines", name="Solar forecast (MW)",
             line=dict(color="#eab308", width=2.5),
             fill="tozeroy", fillcolor="rgba(234,179,8,0.15)",
         ))
     if wind is not None:
         figure.add_trace(go.Scatter(
-            x=timestamps, y=wind, mode="lines", name="Wind total (MW)",
+            x=timestamps, y=wind, mode="lines", name="Wind total forecast (MW)",
             line=dict(color="#14b8a6", width=2.5),
             fill="tozeroy", fillcolor="rgba(20,184,166,0.15)",
         ))
     if net_load is not None:
         figure.add_trace(go.Scatter(
-            x=timestamps, y=net_load, mode="lines", name="Net load (MW)",
+            x=timestamps, y=net_load, mode="lines", name="Net load forecast (MW)",
             line=dict(color=get_palette()["text"], width=2.5, dash="dot"),
         ))
     ts_min = pd.Timestamp(np.asarray(timestamps).min())
@@ -1093,6 +1140,73 @@ def render_status_banner(forecast_date, expert_id):
             st.html(html)
 
 
+@st.dialog("Confirm your submission", width="large")
+def confirm_submission_dialog(working, keep_as_is, confidence, expert_id, forecast_date, model_name, survey_key):
+    """Pop-up opened by either submit button. Shows how the expert's curve
+    differs from the model forecast (adjusted minus forecast, per 15-min
+    slot) and saves only on "Confirm & submit". "Go back and edit" or the X
+    closes it with nothing saved. Clicks inside a dialog rerun only the
+    dialog, with the same arguments, so `working` is the curve as it was
+    when the button was clicked."""
+    forecast = working["forecast"].values
+    adjusted = forecast if keep_as_is else working["adjusted"].values
+    diff = np.round(adjusted - forecast, 2)
+
+    if keep_as_is:
+        st.write(f"You're keeping the model forecast for **{forecast_date}** as is, so your adjustment is zero everywhere.")
+    else:
+        st.write(f"This is how your curve for **{forecast_date}** differs from the model forecast. "
+                 "Above zero means you raised the price, below zero means you lowered it.")
+
+    st.plotly_chart(make_adjustment_chart(working["timestamp_slot"].values, diff), width="stretch")
+
+    changed = diff != 0
+    if changed.any():
+        biggest = int(np.argmax(np.abs(diff)))
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Time slots changed", f"{int(changed.sum())} of {len(diff)}")
+        c2.metric("Largest change", f"{diff[biggest]:+.2f} EUR/MWh",
+                  help=f"At {working['time_label'].iloc[biggest]}.")
+        c3.metric("Average change", f"{diff.mean():+.2f} EUR/MWh",
+                  help="Averaged over the whole day, including the slots you didn't touch.")
+
+    st.caption(f"Your confidence: {confidence} / 5. Submissions are final.")
+
+    col_confirm, col_back, _ = st.columns([1, 1, 1])
+    confirm = col_confirm.button("Confirm & submit", type="primary")
+    go_back = col_back.button("Go back and edit")
+
+    if go_back:
+        st.rerun()  # closes the pop-up; the dragged curve is still in session state
+    if confirm:
+        if not is_editable(forecast_date):
+            # Checked again here: the pop-up may have been left open past 12:00.
+            st.error("The submission window closed at 12:00. Nothing was saved.")
+        elif has_submitted(expert_id, forecast_date):
+            st.error("A submission already exists for this date. Refresh the page.")
+        else:
+            rows = working.copy()
+            if keep_as_is:
+                rows["adjusted"] = rows["forecast"]  # store exactly the model's curve
+            rows["action"] = "accepted" if keep_as_is else "adjusted"
+            rows["model_name"] = model_name
+            rows["expert_id"] = expert_id
+            rows["forecast_date"] = forecast_date
+            rows["timestamp"] = dt.datetime.now(dt.timezone.utc).isoformat()
+            rows["confidence"] = confidence
+            try:
+                save_submission(rows)
+            except DuplicateSubmissionError:
+                st.error("A submission already exists for this date. Refresh the page.")
+            else:
+                _cached_has_submitted.clear()
+                _cached_load_submissions.clear()
+                _cached_compute_expert_results_summary.clear()
+                _refresh_email_progress(expert_id)  # sidebar countdown reflects this submission right away
+                st.session_state[survey_key] = True
+                st.rerun()  # closes the pop-up; the page reloads into its submitted state
+
+
 def page_review_and_adjust():
     """Core page: load a forecast, show context/charts, let an expert
     adjust it. Behavior by state:
@@ -1182,17 +1296,19 @@ def page_review_and_adjust():
         st.subheader("Day info")
         if context_available:
             st.metric(
-                "Avg. Net BE load (MW)", f"{net_load:,.0f}",
-                help="Gross load minus solar and wind generation: the portion of load "
+                "Avg. net BE load forecast (MW)", f"{net_load:,.0f}",
+                help="Forecast load minus forecast solar and wind generation: the portion of load "
                      "that has to be covered by other (price-setting) generation.",
             )
-            st.metric("Avg. temp (°C)", f"{avg_temp:.1f}")
-            st.metric("Avg. humidity (%)", f"{avg_hum:.0f}")
+            st.metric("Avg. temperature forecast (°C)", f"{avg_temp:.1f}")
+            st.metric("Avg. humidity forecast (%)", f"{avg_hum:.0f}")
+            if COVARIATE_SOURCE_NOTE:
+                st.caption(COVARIATE_SOURCE_NOTE)
 
-            show_temp_sidebar = st.toggle("Show Temperature plot")
-            show_hum_sidebar = st.toggle("Show Humidity plot")
+            show_temp_sidebar = st.toggle("Show temperature forecast plot")
+            show_hum_sidebar = st.toggle("Show humidity forecast plot")
         else:
-            st.info("Weather/load context not available for this date.")
+            st.info("Weather/load forecasts not available for this date.")
             show_temp_sidebar = False
             show_hum_sidebar = False
 
@@ -1205,15 +1321,15 @@ def page_review_and_adjust():
             "can be dragged up or down accordingly."
         )
         st.write(
-            "In the left side panel, the second page: :red[***Deterministic Forecast Analysis***] shows the model forecast against the "
+            "In the left side panel, the second page: :red[***Historic Forecast Analysis***] shows the model forecast against the "
             "actual prices across the last 14 days. Further down, there is relevant day "
             "information, as well as two slider buttons for displaying the temperature and "
-            "humidity plots."
+            "humidity forecast plots."
         )
         st.write(
-            ":green[Renewables (Solar, Wind)] during the given day are plotted underneath the "
+            "Forecasts of :green[renewables (solar, wind)] for the given day are plotted underneath the "
             "draggable forecast using their respective slider button. Turn on **Net load** "
-            "to add load minus solar and wind to the same chart: the part of demand that "
+            "to add forecast load minus solar and wind to the same chart: the part of demand that "
             "other, price-setting generation has to cover. Prices tend to rise when net "
             "load is high, especially in the evening once solar drops off."
         )
@@ -1346,7 +1462,8 @@ def page_review_and_adjust():
     # sidebar's daily average) is an opt-in third series on the same axis.
     if context_available:
         with st.container(border=True):
-            st.subheader("Solar, Wind & Net Load")
+            st.subheader("Solar, Wind & Net Load Forecasts")
+            st.caption("All values in this chart are forecasts for the day, not measurements." + (f" {COVARIATE_SOURCE_NOTE}" if COVARIATE_SOURCE_NOTE else ""))
             sc1, sc2, sc3 = st.columns(3)
             show_solar = sc1.toggle("Solar", value=True)
             show_wind = sc2.toggle("Wind", value=True)
@@ -1376,22 +1493,22 @@ def page_review_and_adjust():
             wc1, wc2 = st.columns(2)
             with wc1:
                 st.plotly_chart(
-                    make_simple_chart(day_rows["Date"].values, day_rows["temperature_2m"].values, "Temperature (°C)"),
+                    make_simple_chart(day_rows["Date"].values, day_rows["temperature_2m"].values, "Temperature forecast (°C)"),
                     width="stretch",
                 )
             with wc2:
                 st.plotly_chart(
-                    make_simple_chart(day_rows["Date"].values, day_rows["relative_humidity_2m"].values, "Humidity (%)"),
+                    make_simple_chart(day_rows["Date"].values, day_rows["relative_humidity_2m"].values, "Humidity forecast (%)"),
                     width="stretch",
                 )
         elif show_temp_sidebar:
             st.plotly_chart(
-                make_simple_chart(day_rows["Date"].values, day_rows["temperature_2m"].values, "Temperature (°C)"),
+                make_simple_chart(day_rows["Date"].values, day_rows["temperature_2m"].values, "Temperature forecast (°C)"),
                 width="stretch",
             )
         elif show_hum_sidebar:
             st.plotly_chart(
-                make_simple_chart(day_rows["Date"].values, day_rows["relative_humidity_2m"].values, "Humidity (%)"),
+                make_simple_chart(day_rows["Date"].values, day_rows["relative_humidity_2m"].values, "Humidity forecast (%)"),
                 width="stretch",
             )
 
@@ -1430,25 +1547,12 @@ def page_review_and_adjust():
             elif has_submitted(expert_id, forecast_date):
                 st.error("A submission already exists for this date. Refresh the page.")
             else:
-                rows = working.copy()
-                if keep_as_is:
-                    rows["adjusted"] = rows["forecast"]  # store exactly the model's curve
-                rows["action"] = "accepted" if keep_as_is else "adjusted"
-                rows["model_name"] = model_for_day(forecast_date, dnn_df)
-                rows["expert_id"] = expert_id
-                rows["forecast_date"] = forecast_date
-                rows["timestamp"] = dt.datetime.now(dt.timezone.utc).isoformat()
-                rows["confidence"] = confidence
-                try:
-                    save_submission(rows)
-                except DuplicateSubmissionError:
-                    st.error("A submission already exists for this date. Refresh the page.")
-                else:
-                    _cached_has_submitted.clear()
-                    _cached_load_submissions.clear()
-                    st.session_state[survey_key] = True
-                    render_success_banner(f"Forecast submitted for {forecast_date}!")
-                    st.rerun()
+                # Nothing is saved yet: the pop-up shows the change and
+                # saves only when the expert clicks "Confirm & submit".
+                confirm_submission_dialog(
+                    working, keep_as_is, confidence, expert_id, forecast_date,
+                    model_for_day(forecast_date, dnn_df), survey_key,
+                )
 
 
 # --------------------------------------------------------------------------
@@ -1462,6 +1566,207 @@ def get_last_evaluable_ts(now=None):
     now = now if now is not None else pd.Timestamp.now(tz="Europe/Brussels").tz_localize(None)
     tomorrow_start = now.normalize() + pd.Timedelta(days=1)
     return tomorrow_start - pd.Timedelta(minutes=15)
+
+
+# --------------------------------------------------------------------------
+# RESULTS-EMAIL NOTIFICATIONS
+#
+# Once an expert has more than RESULTS_EMAIL_THRESHOLD_DAYS settled/graded
+# days, they get an email with their current aggregate stats -- checked
+# once per login (see main()), and re-sent only every further
+# RESULTS_EMAIL_THRESHOLD_DAYS days (tracked in email_notifications).
+# Streamlit has no background scheduler, so the email itself only goes out
+# the next time that expert opens the app.
+# --------------------------------------------------------------------------
+
+def compute_expert_results_summary(expert_id):
+    """Aggregates this one expert's settled (evaluated) days into the same
+    stats shown on the Expert Scoreboard -- avg. MAE improvement, days
+    reviewed, win rate, avg. confidence. Deliberately mirrors
+    page_expert_scoreboard()'s per-expert aggregation rather than sharing
+    code with it, so a future change to that page can't silently change
+    what gets emailed (or vice versa).
+
+    Returns None if this expert has no settled/evaluable days yet."""
+    log = _cached_load_submissions(expert_id=expert_id)
+    if not log.empty:
+        log = log[log["action"] != "legacy"]  # same rule as the Expert Scoreboard
+    if log.empty:
+        return None
+
+    be_df = get_be_df()
+    last_evaluable = get_last_evaluable_ts()
+
+    results = []
+    for forecast_date, group in log.groupby("forecast_date"):
+        if pd.Timestamp(forecast_date) > last_evaluable:
+            continue  # not settled yet, same rule as Reveal & Evaluate/Scoreboard
+
+        actuals = be_df.loc[be_df["date_only"] == forecast_date, ["Date", "Price"]].rename(
+            columns={"Date": "timestamp_slot", "Price": "actual"}
+        )
+        evaluation = group.merge(actuals, on="timestamp_slot", how="inner").dropna(subset=["actual"])
+        if evaluation.empty:
+            continue
+
+        forecast_mae = (evaluation["forecast"] - evaluation["actual"]).abs().mean()
+        adjusted_mae = (evaluation["adjusted"] - evaluation["actual"]).abs().mean()
+        results.append({
+            "forecast_date": forecast_date,
+            "improvement": forecast_mae - adjusted_mae,
+            "confidence": group["confidence"].iloc[0],
+        })
+
+    if not results:
+        return None
+
+    results_df = pd.DataFrame(results)
+    return {
+        "days_reviewed": int(results_df["forecast_date"].nunique()),
+        "avg_improvement": round(float(results_df["improvement"].mean()), 2),
+        "win_rate": round(float((results_df["improvement"] > 0).mean() * 100), 1),
+        "avg_confidence": round(float(results_df["confidence"].mean()), 1),
+    }
+
+
+def send_results_email(to_email, username, stats):
+    """Sends a plain-text summary of `stats` to `to_email` via Gmail SMTP.
+    Raises on any failure (missing config, auth failure, network error) --
+    the caller, maybe_send_results_email(), is responsible for catching
+    that so a flaky send can never break a page render for the person
+    using the app right now."""
+    if not GMAIL_SENDER_ADDRESS or not GMAIL_APP_PASSWORD:
+        raise RuntimeError("GMAIL_SENDER_ADDRESS / GMAIL_APP_PASSWORD not configured")
+
+    body = (
+        f"Hi {username},\n\n"
+        f"You've now reviewed {stats['days_reviewed']} settled forecast days on the "
+        f"EPF Expert Review app. Here are your current numbers:\n\n"
+        f"  Avg. MAE improvement: {stats['avg_improvement']} EUR/MWh (Forecast MAE minus Adjusted MAE, averaged across your settled days)\n"
+        f"  Win rate: {stats['win_rate']}% (share of your settled days where Adjusted MAE was lower than Forecast MAE)\n"
+        f"  Avg. confidence: {stats['avg_confidence']} / 5 (your own self-reported rating, averaged across those same days)\n\n"
+        f"{APP_URL}\n\n"
+        f"Thank you for taking part in this study. Your reviews are what make this research possible.\n\n"
+        f"EPF Expert Review (automated message, part of the research study)"
+    )
+    msg = MIMEText(body)
+    msg["Subject"] = f"Your EPF Expert Review results ({stats['days_reviewed']} days reviewed)"
+    msg["From"] = GMAIL_SENDER_ADDRESS
+    msg["To"] = to_email
+
+    # STARTTLS on 587 rather than implicit SSL on 465 -- some networks
+    # (VPNs, campus/corporate wifi, certain routers) block 465 outright
+    # while leaving 587 open, and 587+STARTTLS is Gmail's own documented
+    # recommendation for SMTP clients.
+    with smtplib.SMTP("smtp.gmail.com", 587, timeout=15) as server:
+        server.starttls()
+        server.login(GMAIL_SENDER_ADDRESS, GMAIL_APP_PASSWORD)
+        server.sendmail(GMAIL_SENDER_ADDRESS, [to_email], msg.as_string())
+
+
+@st.cache_data(ttl=15)
+def _cached_compute_expert_results_summary(expert_id):
+    """Same short-TTL treatment as _cached_load_submissions: this wraps a
+    per-day groupby/merge over an expert's full submission history.
+    render_email_progress_sidebar() calls it on every single rerun of the
+    app for a logged-in expert (every drag release, every button click,
+    every page switch) -- not just once per login like
+    maybe_send_results_email() -- so leaving it uncached meant redoing
+    that whole aggregation on every rerun. Cleared the moment a new
+    submission is actually saved (page_review_and_adjust()), so the
+    displayed count updates immediately rather than waiting out the TTL."""
+    return compute_expert_results_summary(expert_id)
+
+
+@st.cache_data(ttl=30)
+def _cached_get_last_emailed_days_reviewed(username):
+    """Same treatment as _cached_get_onboarding_status: render_email_progress_sidebar()
+    calls this on every rerun, so left uncached it was a live Postgres
+    round-trip on every single click/drag for every logged-in expert, not
+    just once per login. Cleared the moment a results email is actually
+    sent, in maybe_send_results_email(), so the countdown updates right
+    away rather than waiting out the TTL."""
+    return get_last_emailed_days_reviewed(username)
+
+
+def _refresh_email_progress(username):
+    """Computes this expert's results-email progress and stores it in
+    st.session_state. This is the only place that actually touches the
+    database or recomputes the per-day aggregation for this feature --
+    render_email_progress_sidebar() below only ever reads the stored
+    result, since it's called on every single rerun of the app (including
+    every chart drag, the single most rerun-heavy interaction in the app),
+    and recomputing on a timer there was adding real per-drag latency
+    even with short-TTL caching. Called once at login (see main()), and
+    again only at the two moments these numbers can actually change: a
+    new submission (page_review_and_adjust()) and a results email
+    actually being sent (maybe_send_results_email())."""
+    stats = _cached_compute_expert_results_summary(username)
+    days_reviewed = stats["days_reviewed"] if stats else 0
+    last_emailed = _cached_get_last_emailed_days_reviewed(username)
+    # Mirrors maybe_send_results_email()'s own threshold logic exactly:
+    # the first email needs days_reviewed > RESULTS_EMAIL_THRESHOLD_DAYS
+    # (so day 11, not day 10), every one after that needs a further full
+    # RESULTS_EMAIL_THRESHOLD_DAYS past the last email actually sent.
+    next_target = (
+        RESULTS_EMAIL_THRESHOLD_DAYS + 1 if last_emailed == 0
+        else last_emailed + RESULTS_EMAIL_THRESHOLD_DAYS
+    )
+    st.session_state["email_progress"] = {"days_reviewed": days_reviewed, "next_target": next_target}
+
+
+def render_email_progress_sidebar(username):
+    """Shown in the sidebar for every expert, every page (see main()): how
+    many more reviewed (settled) days remain until their next automatic
+    results email. Pure read from st.session_state -- see
+    _refresh_email_progress() for where and how often that's populated --
+    so this costs nothing extra on an ordinary rerun."""
+    if "email_progress" not in st.session_state:
+        _refresh_email_progress(username)
+    progress = st.session_state["email_progress"]
+    days_reviewed = progress["days_reviewed"]
+    next_target = progress["next_target"]
+    remaining = max(next_target - days_reviewed, 0)
+
+    st.caption(f"Results email: {days_reviewed}/{next_target} reviewed days")
+    st.progress(min(days_reviewed / next_target, 1.0))
+    if remaining > 0:
+        st.caption(f"{remaining} more reviewed day{'s' if remaining != 1 else ''} until your next results email.")
+    else:
+        st.caption("Your next results email will be sent at your next login.")
+
+
+def maybe_send_results_email(username):
+    """Checked once per login (see main()): sends the first results email
+    once this expert passes RESULTS_EMAIL_THRESHOLD_DAYS evaluated days,
+    then a fresh one only every further RESULTS_EMAIL_THRESHOLD_DAYS days
+    after that (milestone-based, e.g. 11, 21, 31...) rather than on every
+    single new evaluated day -- daily emails would themselves be a signal
+    that could influence how an expert reviews, which runs against the
+    same neutral-framing goal as the email's plain, non-judgmental wording.
+    No-ops quietly -- never raises into the page -- if email isn't
+    configured, this expert has no email on file, or the send itself
+    fails; a failed send is retried at their next login since
+    mark_results_emailed() is only called after a successful send."""
+    stats = compute_expert_results_summary(username)
+    if stats is None or stats["days_reviewed"] <= RESULTS_EMAIL_THRESHOLD_DAYS:
+        return
+
+    last_emailed = get_last_emailed_days_reviewed(username)
+    if stats["days_reviewed"] < last_emailed + RESULTS_EMAIL_THRESHOLD_DAYS:
+        return  # not a full milestone past the last email yet
+
+    user_email = _cached_load_users().get(username, {}).get("email")
+    if not user_email:
+        return
+
+    try:
+        send_results_email(user_email, username, stats)
+        mark_results_emailed(username, stats["days_reviewed"], dt.datetime.now(dt.timezone.utc).isoformat())
+        _cached_get_last_emailed_days_reviewed.clear()
+        _refresh_email_progress(username)  # sidebar countdown reflects the new milestone right away
+    except Exception as e:
+        print(f"[results email] failed to send to {username!r}: {e}")
 
 
 def page_reveal_and_evaluate():
@@ -1743,9 +2048,9 @@ ONBOARDING_STEPS = [
     {
         "title": "Using the extra context",
         "body": (
-            "Below the chart you'll find extra information: temperature, humidity, "
+            "Below the chart you'll find extra information: forecasts of temperature, humidity, "
             "solar and wind output, and net load (demand left after solar and wind) "
-            "over the day. That might help you judge whether the "
+            "for the day. That might help you judge whether the "
             "model's forecast makes sense for that particular day."
         ),
     },
@@ -1884,7 +2189,7 @@ def page_dnn_history():
     her MAE tables). The
     plot design itself is adapted from her public Hugging Face Space; see
     the explanatory text below for the link and what the chart means."""
-    st.title("Deterministic Forecast Analysis")
+    st.title("Historic Forecast Analysis")
     st.caption("Model forecast vs. actual settled price, last 14 days.")
 
     st.markdown(
@@ -2014,19 +2319,30 @@ def main():
         render_onboarding(current_user)
         return
 
+    # Results-email check: once per login session (st.session_state persists
+    # across reruns within one browser session, so this runs once after
+    # login, not on every page switch/drag/rerun). Experts only -- admins
+    # never submit, so they'd never have results to report anyway.
+    if current_role == "expert" and not st.session_state.get("results_email_checked"):
+        st.session_state["results_email_checked"] = True
+        maybe_send_results_email(current_user)
+
     with st.sidebar:
         st.write(f"Logged in as: **{current_user}** ({current_role})")
         if st.button("Log Out"):
             st.session_state.clear()
             st.rerun()
 
+        if current_role == "expert":
+            render_email_progress_sidebar(current_user)
+
         st.divider()
 
         if current_role == "admin":
-            pages = ["Review & Adjust", "Deterministic Forecast Analysis", "Reveal & Evaluate",
+            pages = ["Review & Adjust", "Historic Forecast Analysis", "Reveal & Evaluate",
                      "Expert Scoreboard", "Survey Results"]
         else:
-            pages = ["Review & Adjust", "Deterministic Forecast Analysis"]
+            pages = ["Review & Adjust", "Historic Forecast Analysis"]
 
         page = st.radio("Page", pages)
 
@@ -2036,7 +2352,7 @@ def main():
         page_reveal_and_evaluate()
     elif page == "Expert Scoreboard":
         page_expert_scoreboard()
-    elif page == "Deterministic Forecast Analysis":
+    elif page == "Historic Forecast Analysis":
         page_dnn_history()
     elif page == "Survey Results":
         page_survey_results()
