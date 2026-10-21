@@ -14,9 +14,9 @@ The Review & Adjust page puts the context an electricity market expert would nor
 
 - **Forecast chart**: the DNN forecast at 15-minute resolution (96 slots), with an 80% uncertainty band calibrated from the model's own recent errors (Adaptive Conformal Inference). Slots in the top or bottom 5% of that day's forecast are highlighted as unusual, and the original curve stays visible as a dashed line while the expert drags.
 - **Calendar**: day of the week, whether it's a Belgian public holiday, and whether it's a bridge day (a Monday or Friday between a holiday and the weekend).
-- **Day info** (sidebar): average net Belgian demand (demand minus solar and wind, the part that price-setting generators have to cover), average temperature and average humidity, with optional temperature and humidity plots.
+- **Day info** (sidebar): forecasts of average net Belgian demand (demand minus solar and wind, the part that price-setting generators have to cover), average temperature and average humidity, with optional temperature and humidity forecast plots.
 - **Renewables chart**: solar and wind generation across the day, each togglable.
-- **Recent track record**: the Deterministic Forecast Analysis page shows the DNN forecast against the actual price over the last 14 days (as a time series and as an actual-vs-forecast error scatter), so the expert can see where the model has recently been over- or under-shooting.
+- **Recent track record**: the Historic Forecast Analysis page shows the DNN forecast against the actual price over the last 14 days (as a time series and as an actual-vs-forecast error scatter), so the expert can see where the model has recently been over- or under-shooting.
 
 After submitting, experts answer a short reflection survey, including how useful the extra context was for their adjustment.
 
@@ -36,7 +36,7 @@ The expert adjustments collected here could later serve as feedback for retraini
 
 ## The underlying DNN model
 
-The day-ahead forecast this app asks experts to review is not trained here. It comes from Margarida Mascarenhas's deep neural network, published in her [DAM price forecast Hugging Face Space](https://huggingface.co/spaces/EDS-lab/DAM-price-forecast). The model is retrained and run daily, since a day-ahead price forecast has to be published before each day's auction closes. This app's Deterministic Forecast Analysis page reuses the plot design from that Space, redrawn in this app's own theme.
+The day-ahead forecast this app asks experts to review is not trained here. It comes from Margarida Mascarenhas's deep neural network, published in her [DAM price forecast Hugging Face Space](https://huggingface.co/spaces/EDS-lab/DAM-price-forecast). The model is retrained and run daily, since a day-ahead price forecast has to be published before each day's auction closes. This app's Historic Forecast Analysis page reuses the plot design from that Space, redrawn in this app's own theme.
 
 ## Origin
 
@@ -67,19 +67,21 @@ streamlit run app.py
 
 `DATABASE_URL` points to a Postgres instance (this project runs on Supabase; any Postgres host works). Tables are created automatically on first run.
 
+`GMAIL_SENDER_ADDRESS` / `GMAIL_APP_PASSWORD` are optional: once set, experts automatically get an email with their aggregate results after they pass 10 reviewed days, then every further 10. Leave them blank to skip email entirely. Sending uses Gmail SMTP (port 587), which Render blocks on its free tier, so the service needs a paid plan.
+
 ## Deployment
 
 Hosted on Render as a Docker web service, connected to this repo for auto-deploy on push to `main`. Secrets are set in Render's dashboard, never committed. The database is a separate, always-on Supabase Postgres instance.
 
 ## Roles & pages
 
-- **expert**: Review & Adjust and Deterministic Forecast Analysis only, and can only view/submit their own work. Submissions are final.
+- **expert**: Review & Adjust and Historic Forecast Analysis only, and can only view/submit their own work. Submissions are final.
 - **admin**: everything above, plus Reveal & Evaluate, Expert Scoreboard, and Survey Results; can view but never submit on an expert's behalf.
 
 | Page | Purpose |
 |---|---|
 | Review & Adjust | View forecast, drag to adjust, rate confidence, submit, answer reflection survey. |
-| Deterministic Forecast Analysis | DNN forecast vs. actual, last 14 days: time series + error scatter. |
+| Historic Forecast Analysis | DNN forecast vs. actual, last 14 days: time series + error scatter. |
 | Reveal & Evaluate (admin) | Accuracy for one expert's submission once the price settles. |
 | Expert Scoreboard (admin) | Aggregated accuracy improvement per expert. |
 | Survey Results (admin) | Reflection-survey data + experience profiles; CSV export. |
