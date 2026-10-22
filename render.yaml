@@ -15,3 +15,7 @@ services:
         sync: false         # set manually in the Render dashboard, never committed to git
       - key: GITHUB_TOKEN
         sync: false
+      - key: GMAIL_SENDER_ADDRESS
+        sync: false
+      - key: GMAIL_APP_PASSWORD
+        sync: false
