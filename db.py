@@ -186,6 +186,21 @@ def init_db():
                 FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE
             )
         """))
+        # Forgot-password links (see the PASSWORD RESET section in app.py).
+        # Only a SHA-256 hash of each emailed token is stored, so someone
+        # who reads this table can't use it to reset anyone's password.
+        # Times use the database clock (now()), not FAKE_NOW, so expiry is
+        # always measured in real time.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS password_resets (
+                token_hash TEXT PRIMARY KEY,
+                username TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                expires_at TIMESTAMPTZ NOT NULL,
+                used_at TIMESTAMPTZ,
+                FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE
+            )
+        """))
     # engine.begin() commits automatically here, on a clean exit of the block.
 
 
@@ -201,6 +216,84 @@ def save_new_user(username, password_hash, email, role):
             text("INSERT INTO users (username, email, password_hash, role) VALUES (:username, :email, :password_hash, :role)"),
             {"username": username, "email": email.strip().lower(), "password_hash": password_hash, "role": role},
         )
+
+
+def get_user_by_email(email):
+    """Returns (username, email) for the account registered with `email`,
+    or None. Emails are stored lowercased (see save_new_user)."""
+    with _get_engine().connect() as conn:
+        row = conn.execute(
+            text("SELECT username, email FROM users WHERE email = :email"),
+            {"email": email.strip().lower()},
+        ).first()
+    return (row.username, row.email) if row else None
+
+
+def count_recent_password_resets(username, minutes=60):
+    """How many reset links were issued for `username` in the last `minutes`
+    -- used to cap how often someone can trigger reset emails."""
+    with _get_engine().connect() as conn:
+        return conn.execute(
+            text("""
+                SELECT COUNT(*) FROM password_resets
+                WHERE username = :username
+                  AND created_at > now() - make_interval(mins => :minutes)
+            """),
+            {"username": username, "minutes": minutes},
+        ).scalar()
+
+
+def create_password_reset(username, token_hash, valid_minutes):
+    """Stores a new reset token (hashed) that expires after `valid_minutes`."""
+    with _get_engine().begin() as conn:
+        conn.execute(
+            text("""
+                INSERT INTO password_resets (token_hash, username, expires_at)
+                VALUES (:token_hash, :username, now() + make_interval(mins => :valid_minutes))
+            """),
+            {"token_hash": token_hash, "username": username, "valid_minutes": valid_minutes},
+        )
+
+
+def get_valid_password_reset(token_hash):
+    """Returns the username a reset token belongs to, or None if the token
+    doesn't exist, has expired, or was already used."""
+    with _get_engine().connect() as conn:
+        row = conn.execute(
+            text("""
+                SELECT username FROM password_resets
+                WHERE token_hash = :token_hash AND used_at IS NULL AND expires_at > now()
+            """),
+            {"token_hash": token_hash},
+        ).first()
+    return row.username if row else None
+
+
+def complete_password_reset(token_hash, new_password_hash):
+    """Sets the new password and uses up the token, in one transaction.
+    Also invalidates any other open reset links for the same user. Returns
+    the username, or None if the token wasn't valid any more (e.g. it was
+    used in another tab a moment ago)."""
+    with _get_engine().begin() as conn:
+        row = conn.execute(
+            text("""
+                UPDATE password_resets SET used_at = now()
+                WHERE token_hash = :token_hash AND used_at IS NULL AND expires_at > now()
+                RETURNING username
+            """),
+            {"token_hash": token_hash},
+        ).first()
+        if row is None:
+            return None
+        conn.execute(
+            text("UPDATE users SET password_hash = :password_hash WHERE username = :username"),
+            {"password_hash": new_password_hash, "username": row.username},
+        )
+        conn.execute(
+            text("UPDATE password_resets SET used_at = now() WHERE username = :username AND used_at IS NULL"),
+            {"username": row.username},
+        )
+    return row.username
 
 
 class DuplicateSubmissionError(Exception):

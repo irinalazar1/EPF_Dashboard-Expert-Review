@@ -56,6 +56,8 @@ from zoneinfo import ZoneInfo
 from collections import deque
 from datetime import timedelta
 
+import hashlib
+import secrets
 import smtplib
 from email.mime.text import MIMEText
 
@@ -75,6 +77,8 @@ from db import (
     get_onboarding_status, save_onboarding_status,
     record_forecast_published, load_forecast_availability,
     get_last_emailed_days_reviewed, mark_results_emailed,
+    get_user_by_email, count_recent_password_resets, create_password_reset,
+    get_valid_password_reset, complete_password_reset,
 )
 from draggable_curve import draggable_curve
 
@@ -166,7 +170,11 @@ COVARIATE_SOURCE_NOTE = ""
 GMAIL_SENDER_ADDRESS = os.getenv("GMAIL_SENDER_ADDRESS")
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 RESULTS_EMAIL_THRESHOLD_DAYS = 10  # send once an expert has *more than* this many evaluated days
-APP_URL = "https://epf-dashboard-expert-review.onrender.com/"  # linked from the results email
+# Linked from the results and password-reset emails. Set APP_URL in .env
+# (e.g. http://localhost:8501/) to test reset links locally.
+APP_URL = os.getenv("APP_URL", "https://epf-dashboard-expert-review.onrender.com/")
+RESET_LINK_VALID_MINUTES = 30   # how long a forgot-password link works
+MAX_RESET_EMAILS_PER_HOUR = 3   # per account, so the form can't be used to spam someone
 
 STEPS_PER_DAY = 96  # 15-minute resolution: 24h * 4
 
@@ -975,6 +983,14 @@ def validate_registration(username, email, password):
         return False, "All fields (Username, Email, and Password) are required."
     if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
         return False, "Please enter a valid email address."
+    return validate_new_password(password)
+
+
+def validate_new_password(password):
+    """Password rules shared by registration and password reset. Returns
+    (is_valid, error_message)."""
+    if not password:
+        return False, "Please enter a password."
     if len(password) < 8:
         return False, "Password must be at least 8 characters long."
     if not re.search(r"[A-Za-z]", password) or not re.search(r"[0-9]", password):
@@ -1635,9 +1651,6 @@ def send_results_email(to_email, username, stats):
     the caller, maybe_send_results_email(), is responsible for catching
     that so a flaky send can never break a page render for the person
     using the app right now."""
-    if not GMAIL_SENDER_ADDRESS or not GMAIL_APP_PASSWORD:
-        raise RuntimeError("GMAIL_SENDER_ADDRESS / GMAIL_APP_PASSWORD not configured")
-
     body = (
         f"Hi {username},\n\n"
         f"You've now reviewed {stats['days_reviewed']} settled forecast days on the "
@@ -1649,8 +1662,21 @@ def send_results_email(to_email, username, stats):
         f"Thank you for taking part in this study. Your reviews are what make this research possible.\n\n"
         f"EPF Expert Review (automated message, part of the research study)"
     )
+    send_email(to_email, f"Your EPF Expert Review results ({stats['days_reviewed']} days reviewed)", body)
+
+
+def email_configured():
+    return bool(GMAIL_SENDER_ADDRESS and GMAIL_APP_PASSWORD)
+
+
+def send_email(to_email, subject, body):
+    """Sends a plain-text email via Gmail SMTP. Raises on any failure
+    (missing config, auth failure, network error); callers catch it."""
+    if not email_configured():
+        raise RuntimeError("GMAIL_SENDER_ADDRESS / GMAIL_APP_PASSWORD not configured")
+
     msg = MIMEText(body)
-    msg["Subject"] = f"Your EPF Expert Review results ({stats['days_reviewed']} days reviewed)"
+    msg["Subject"] = subject
     msg["From"] = GMAIL_SENDER_ADDRESS
     msg["To"] = to_email
 
@@ -2133,6 +2159,122 @@ def render_success_banner(message):
 
 
 # --------------------------------------------------------------------------
+# PASSWORD RESET
+# --------------------------------------------------------------------------
+# Flow: "Forgot Password" on the auth screen -> enter email -> if it belongs
+# to an account, a one-time link (APP_URL?reset=<token>) is emailed. Opening
+# it shows render_reset_password_screen() (routed from main()) where a new
+# password is set. Tokens are random, single-use, expire after
+# RESET_LINK_VALID_MINUTES, and only their SHA-256 hash is stored.
+
+def _hash_reset_token(token):
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def request_password_reset(email):
+    """Emails a reset link if `email` belongs to an account. Returns
+    "sent", "unknown" (no such account), "rate_limited" or "error". The
+    screen shows the same message for "sent" and "unknown", so the form
+    can't be used to find out who has an account."""
+    user = get_user_by_email(email)
+    if user is None:
+        return "unknown"
+    username, to_email = user
+    if count_recent_password_resets(username) >= MAX_RESET_EMAILS_PER_HOUR:
+        return "rate_limited"
+
+    token = secrets.token_urlsafe(32)
+    create_password_reset(username, _hash_reset_token(token), RESET_LINK_VALID_MINUTES)
+    link = f"{APP_URL.rstrip('/')}/?reset={token}"
+    body = (
+        f"Hi {username},\n\n"
+        f"Someone (hopefully you) asked to reset the password for your EPF Expert Review account.\n\n"
+        f"To choose a new password, open this link within {RESET_LINK_VALID_MINUTES} minutes:\n\n"
+        f"{link}\n\n"
+        f"The link works once. If you didn't ask for this, you can ignore this email: "
+        f"your password stays the same.\n\n"
+        f"EPF Expert Review (automated message, part of the research study)"
+    )
+    try:
+        send_email(to_email, "Reset your EPF Expert Review password", body)
+    except Exception as exc:
+        print(f"[password reset] email to {username} failed: {exc}")
+        return "error"
+    return "sent"
+
+
+def render_forgot_password_form():
+    """The "Forgot Password" option on the auth screen."""
+    if not email_configured():
+        st.info("Password reset by email isn't available right now. "
+                "Please contact the study team to reset your password.")
+        return
+
+    st.write("Enter the email address you registered with, and we'll send you a link to set a new password.")
+    reset_email = st.text_input("Email Address", key="reset_email")
+    if st.button("Send Reset Link"):
+        email_input = reset_email.strip().lower()
+        if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email_input):
+            st.error("Please enter a valid email address.")
+            return
+        with st.spinner("Sending..."):
+            result = request_password_reset(email_input)
+        if result in ("sent", "unknown"):
+            render_success_banner(
+                f"If an account exists for {email_input}, a reset link is on its way. "
+                f"It works for {RESET_LINK_VALID_MINUTES} minutes. Check your spam folder if it doesn't arrive."
+            )
+        elif result == "rate_limited":
+            st.error("Too many reset emails were requested for this account. Please wait an hour and try again.")
+        else:
+            st.error("We couldn't send the email just now. Please try again in a few minutes.")
+
+
+def _leave_reset_screen():
+    st.query_params.clear()
+    st.rerun()
+
+
+def render_reset_password_screen(token):
+    """Opened from the emailed link (?reset=<token>), see main()."""
+    st.subheader("Set a new password")
+    token_hash = _hash_reset_token(token)
+    username = get_valid_password_reset(token_hash)
+    if username is None:
+        st.error("This reset link is invalid, has expired, or was already used. "
+                 "You can request a new one from the Forgot Password option.")
+        if st.button("Back to Log In"):
+            _leave_reset_screen()
+        return
+
+    st.write(f"Account: **{username}**")
+    new_pass = st.text_input("New Password", type="password", key="reset_new_pass")
+    confirm_pass = st.text_input("Confirm New Password", type="password", key="reset_confirm_pass")
+    st.caption("At least 8 characters, with both letters and numbers.")
+
+    col1, col2 = st.columns([1, 5])
+    with col1:
+        save = st.button("Save Password", type="primary")
+    with col2:
+        if st.button("Cancel"):
+            _leave_reset_screen()
+
+    if save:
+        is_valid, message = validate_new_password(new_pass)
+        if not is_valid:
+            st.error(message)
+        elif new_pass != confirm_pass:
+            st.error("The two passwords don't match.")
+        elif complete_password_reset(token_hash, hash_password(new_pass)) is None:
+            st.error("This reset link has just expired or was already used. Please request a new one.")
+        else:
+            _cached_load_users.clear()
+            st.session_state.clear()  # log out anyone logged in in this browser
+            st.session_state["password_reset_done"] = True
+            _leave_reset_screen()
+
+
+# --------------------------------------------------------------------------
 # AUTH SCREEN
 # --------------------------------------------------------------------------
 
@@ -2142,8 +2284,15 @@ def auth_screen():
     in the database."""
     st.subheader("Welcome to EPF Expert Review")
 
-    auth_mode = st.radio("Choose an option:", ["Log In", "Create Account"], horizontal=True)
+    if st.session_state.pop("password_reset_done", False):
+        render_success_banner("Your password has been changed. You can now log in with your new password.")
+
+    auth_mode = st.radio("Choose an option:", ["Log In", "Create Account", "Forgot Password"], horizontal=True)
     st.divider()
+
+    if auth_mode == "Forgot Password":
+        render_forgot_password_form()
+        return
 
     if auth_mode == "Log In":
         login_user = st.text_input("Username", key="login_user")
@@ -2306,6 +2455,11 @@ def main():
     routes to the selected page. Available pages depend on role -- see the
     module docstring at the top of this file for what each role can see."""
     apply_theme()
+
+    reset_token = st.query_params.get("reset")
+    if reset_token:
+        render_reset_password_screen(reset_token)
+        return
 
     if "logged_in_user" not in st.session_state:
         auth_screen()
